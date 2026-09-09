@@ -24,22 +24,86 @@ cancellation data at all. It produces:
   before its linked lesson.
 - `/calendar.ics?debug=1` — temporary diagnostic endpoint (see "Cleanup" below).
 
-## THE ONE THING LEFT TO DO
+## Current status (updated after user testing)
 
-Nothing blocking. `/calendar.ics` and `/homework.ics` are both live and
-returning real data as of the last verification. What's left is optional:
+`/calendar.ics` is confirmed correctly deployed and subscribed on the user's
+device, showing the right times. `/homework.ics` is confirmed returning
+correct data server-side, but the user could not get it to appear in the
+**Reminders** app after subscribing via iOS Settings → Calendar → Accounts →
+Add Subscribed Calendar.
 
-1. **Subscribe to the URLs** from Apple Calendar / Google Calendar /
-   Reminders, per the repo's `README.md`, if that hasn't been done yet.
-2. **Watch for a real cancelled lesson** at some point during the term and
-   confirm it shows up correctly as `[CANCELLED]` — this logic has never
-   been exercised against real cancellation data, only written against the
-   documented/observed field shape.
-3. Consider adding the Cron Trigger check from the README (it's already in
-   `wrangler.toml`, just confirm it's actually firing every 30 min in the
-   Cloudflare dashboard's Trigger Events tab).
+### Root cause: this is an Apple platform limitation, not a bug here
 
-## Architecture (file by file)
+iOS/macOS's generic "Subscribed Calendar" feature (`webcal://`/`https://`
+`.ics` URL subscription) only imports `VEVENT` components into Calendar.app.
+It does **not** import `VTODO` components into Reminders.app at all — this
+is a longstanding, well-known Apple limitation, not something fixable by
+changing the ICS output. Confirmed empirically: the user subscribed
+correctly, Calendar accepted the subscription, but no VTODOs surfaced in
+Reminders anywhere.
+
+### Options presented to the user (awaiting their choice)
+
+**A. Convert `/homework.ics` from VTODO to VEVENT.** Reuses the exact
+mechanism already proven working for `/calendar.ics`. Shows up reliably as
+calendar entries on the right day. Loses "checkable task" semantics — it's
+just a calendar block, not a completable reminder.
+
+**B. Real CalDAV write into the user's actual iCloud Reminders**, using an
+Apple ID app-specific password (generated at appleid.apple.com, revocable,
+never the real account password) stored as a Cloudflare secret. The Worker
+would do CalDAV discovery (PROPFIND against `caldav.icloud.com`) then PUT
+real VTODO items into a genuine iCloud list. Native, checkable, syncs
+everywhere, real notifications. Significantly more code (CalDAV client from
+scratch) and involves a real (if scoped/revocable) credential.
+
+**C. An Apple Shortcut the user builds/runs on-device.** Expose a plain
+`/homework.json` endpoint (not built yet); user builds a Shortcut (Get
+Contents of URL → parse JSON → loop → "Add New Reminder") and sets it as a
+daily Personal Automation. Zero credentials touch the Worker — Shortcuts
+already has on-device Reminders access. Needs the user to build/import the
+Shortcut once and handle de-duplication logic (so it doesn't re-add the same
+homework every run) themselves in Shortcuts.
+
+**Recommendation given to the user**: C if they're willing to spend ~10 min
+in Shortcuts (safest, no credentials anywhere); A for zero extra setup right
+now; B only if "real checkable task in Reminders" matters enough to justify
+a CalDAV implementation. **No option has been implemented yet** — waiting
+on the user's pick before writing any of A/B/C's code.
+
+## Long-term signed-in confidence
+
+Refresh token: 8h lifetime, rotates every use. Cron trigger fires every 30
+min regardless of user activity (confirmed live in the dashboard: "Runs
+Every 30 minutes" under Trigger Events) — that's ~16 refresh opportunities
+per 8h window, so it should never lapse under normal operation. Only failure
+mode: if Cloudflare's cron silently stops firing (or gets disabled) for
+>8h straight, the token goes stale and needs a fresh manual paste again
+(same procedure as before — see "What went wrong" below for the exact
+symptoms to watch for: empty calendar + a 401/"Token revoked" on the
+debug path, though the debug path has since been removed — re-add a
+temporary one if this happens again, following the pattern removed in this
+session's "Cleanup" section).
+
+## IMPORTANT: the timezone logic is NOT a real UTC conversion (read this first)
+
+`src/index.ts`'s `localWallToUtc()` used to genuinely convert Somtoday's raw
+local-time digits (e.g. `07:30`, no offset — this is Amsterdam civil time in
+the API) through `Europe/Amsterdam`'s real UTC offset, landing on the
+mathematically correct America/Curacao equivalent (a real ~6-hour shift,
+e.g. 07:30 NL becomes 01:30 AST). **That was wrong for this user's actual
+situation.** Per direct clarification: Somtoday prints "07:30" as a bell-
+schedule number, but the user personally operates on that exact same clock
+digit as their real Curacao time (e.g., they say "I start at 7:30am" meaning
+7:30 Curacao, not 7:30 Amsterdam converted). So the fix was to **stop doing
+real timezone math entirely** for lesson times: `localWallToUtc()` now takes
+the raw Somtoday digits and localizes them directly as `America/Curacao`
+civil time (fixed UTC-4), via `AST_TZ` instead of `"Europe/Amsterdam"`.
+`zonedWallTimeToUtc()` itself (in `src/ics.ts`) is unchanged and still
+correct in general — only which timezone we tell it to interpret the raw
+digits *as* changed. **Do not "fix" this back to a real Amsterdam→Curacao
+conversion without re-confirming with the user first** — it was deliberately
+reverted from that to match their real-world need.
 
 - **`src/index.ts`** — the Worker entry point. Routes `/calendar.ics`,
   `/homework.ics`, `/calendar.ics?debug=1`. Contains `syncAndCache()` (the
