@@ -97,9 +97,19 @@ function isoWeek(d: Date): { year: number; week: number } {
   return { year: date.getUTCFullYear(), week };
 }
 
+// Somtoday's real API uses a custom media type, confirmed live from the
+// app's own requests. Without a matching Accept header, api.somtoday.nl
+// returns 200 with a technically-valid but EMPTY items array rather than
+// an error — that was the actual cause of the empty calendar, not an auth
+// or leerlingId problem (the token and leerlingId were both correct).
+const SOMTODAY_MEDIA_TYPE = "application/vnd.topicus.platinum+json; charset=utf-8";
+
 async function apiGet<T>(path: string, accessToken: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: SOMTODAY_MEDIA_TYPE,
+    },
   });
   if (!res.ok) {
     throw new Error(`Somtoday API ${path} -> ${res.status}: ${await res.text()}`);
