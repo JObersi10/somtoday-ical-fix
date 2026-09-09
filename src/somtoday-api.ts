@@ -122,7 +122,10 @@ export async function fetchAfspraken(
   const results = await Promise.all(
     weeks.map(({ year, week }) =>
       apiGet<{ items: RAfspraakItem[] }>(`/afspraakitems/${leerlingId}/jaar/${year}/week/${week}`, accessToken)
-        .then((r) => r.items)
+        .then((r) => {
+          console.log(`afspraakitems jaar/${year}/week/${week}: ${r.items?.length ?? "no items key"} items, leerlingId=${leerlingId}`);
+          return r.items;
+        })
         .catch((err) => {
           console.error(`afspraakitems jaar/${year}/week/${week} failed:`, err instanceof Error ? err.message : err);
           return [] as RAfspraakItem[];
