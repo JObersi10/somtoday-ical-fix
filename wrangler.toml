@@ -9,6 +9,17 @@ compatibility_date = "2025-06-01"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Non-secret: safe to commit. This is your Somtoday leerling (student) ID,
+# not a credential — it's derivable from your own account and appears in
+# plain request URLs already. Kept here (not as a dashboard "Variable")
+# because a dashboard-only Variable gets reset to whatever wrangler.toml
+# declares on every git-triggered deploy — only Secrets survive that.
+# The actual secret (SOMTODAY_REFRESH_TOKEN) must NOT go here — set it via
+# Cloudflare dashboard -> Worker -> Settings -> Variables and secrets ->
+# Add variable -> type "Secret". That one does persist across deploys.
+[vars]
+SOMTODAY_LEERLING_ID = "7361428924143"
+
 # Create with: wrangler kv namespace create STATE
 # then paste the returned id below.
 kv_namespaces = [
