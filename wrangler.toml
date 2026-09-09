@@ -1,0 +1,25 @@
+name = "somtoday-fix"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Runs the sync automatically every 30 minutes, independent of whether your
+# calendar app happens to be polling — this is what "runs automatically"
+# means here: no server to keep alive, Cloudflare just invokes scheduled()
+# on this cadence forever, for free (well within the free tier's limits).
+[triggers]
+crons = ["*/30 * * * *"]
+
+# Create with: wrangler kv namespace create STATE
+# then paste the returned id below.
+kv_namespaces = [
+  { binding = "STATE", id = "REPLACE_WITH_KV_NAMESPACE_ID" }
+]
+
+# All secrets below are set with:  wrangler secret put NAME
+# (or pasted into Settings -> Variables and Secrets in the dashboard)
+#
+#   SOMTODAY_LEERLING_ID   your numeric leerling id (see README "Finding your leerling ID")
+#   SOMTODAY_REFRESH_TOKEN captured refresh_token (recommended auth mode)
+#   SOMTODAY_ICAL_URL      fallback public iCal feed URL (used only if no API creds set)
+#   HOMEWORK_HOUR          local AST hour (0-23) for homework reminders, default 16
+#   CAL_TOKEN              optional shared secret; if set, callers must add ?token=...
