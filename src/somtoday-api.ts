@@ -123,7 +123,10 @@ export async function fetchAfspraken(
     weeks.map(({ year, week }) =>
       apiGet<{ items: RAfspraakItem[] }>(`/afspraakitems/${leerlingId}/jaar/${year}/week/${week}`, accessToken)
         .then((r) => r.items)
-        .catch(() => [] as RAfspraakItem[])
+        .catch((err) => {
+          console.error(`afspraakitems jaar/${year}/week/${week} failed:`, err instanceof Error ? err.message : err);
+          return [] as RAfspraakItem[];
+        })
     )
   );
 
