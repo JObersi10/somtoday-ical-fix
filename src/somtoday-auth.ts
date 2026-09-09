@@ -41,10 +41,36 @@ export async function getAccessTokenFromBootstrap(
   if (stored && stored.expires_at - Date.now() > 5 * 60 * 1000) {
     return stored.access_token;
   }
-  const rtToUse = stored?.refresh_token || refreshToken;
-  const fresh = await refresh(rtToUse);
-  await kv.put("somtoday_tokens", JSON.stringify(fresh));
-  return fresh.access_token;
+
+  // Somtoday rotates refresh tokens on every use and revokes the whole
+  // chain if it sees the same refresh_token used twice (standard OAuth2
+  // replay protection). Two near-simultaneous invocations of this Worker
+  // (overlapping requests, or a cron tick landing mid-request) could both
+  // read the same stored refresh_token and race to redeem it — the loser
+  // gets a live token pair back but Somtoday immediately revokes it as a
+  // detected replay, which is exactly what happened during testing here.
+  // A simple KV-based lock serializes refreshes: only the first caller
+  // actually hits the token endpoint, everyone else waits and re-reads.
+  const lockKey = "somtoday_refresh_lock";
+  const gotLock = await kv.get(lockKey);
+  if (gotLock) {
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const retry = await kv.get<{ access_token: string; expires_at: number }>("somtoday_tokens", "json");
+      if (retry && retry.expires_at - Date.now() > 5 * 60 * 1000) return retry.access_token;
+    }
+    throw new Error("Timed out waiting for a concurrent token refresh to finish.");
+  }
+
+  await kv.put(lockKey, "1", { expirationTtl: 20 });
+  try {
+    const rtToUse = stored?.refresh_token || refreshToken;
+    const fresh = await refresh(rtToUse);
+    await kv.put("somtoday_tokens", JSON.stringify(fresh));
+    return fresh.access_token;
+  } finally {
+    await kv.delete(lockKey);
+  }
 }
 
 interface TokenSet {
