@@ -1,6 +1,12 @@
 # Handoff — somtoday-fix
 
-Status as of 2026-09-09. Read this before doing anything else with this project.
+Status as of 2026-09-09: **WORKING END TO END.** Both `/calendar.ics` and
+`/homework.ics` confirmed returning real data (65 lesson events, real
+homework items with subjects/descriptions) against the live deployed Worker.
+The debug endpoint and diagnostic logging added during setup have been
+removed. Everything below is historical context for how it got here and
+what's still unverified in real-world use (cancellation detection
+specifically — hasn't hit a real cancelled lesson yet).
 
 ## What this is
 
@@ -20,27 +26,18 @@ cancellation data at all. It produces:
 
 ## THE ONE THING LEFT TO DO
 
-**The Somtoday refresh token currently stored in the Worker's secret is dead.**
-It was revoked by Somtoday's OAuth server as a replay-attack response during
-my own testing (see "What went wrong" below — this is fixed going forward,
-but the already-revoked token can't be un-revoked).
+Nothing blocking. `/calendar.ics` and `/homework.ics` are both live and
+returning real data as of the last verification. What's left is optional:
 
-To fix it:
-
-1. Open [leerling.somtoday.nl](https://leerling.somtoday.nl) in a browser, logged in as the student.
-2. DevTools → Application tab → Local Storage → `https://leerling.somtoday.nl`.
-3. Find the key `CapacitorStorage.<some-uuid>` — its value is a big JSON blob
-   containing `"refresh_token": "eyJ..."`. Copy that value (just the token
-   string, not the whole blob).
-4. Go to the Cloudflare dashboard → Workers & Pages → `somtoday-ical-fix` →
-   Settings → Variables and secrets → find `SOMTODAY_REFRESH_TOKEN` → edit →
-   paste the new value → Save (this will trigger a redeploy automatically).
-5. Wait ~15–20 seconds, then test: `curl https://somtoday-ical-fix.jadenrayobersi.workers.dev/calendar.ics`
-   should return a VCALENDAR with real VEVENT blocks in it (not just an
-   empty shell). **Only test it once or twice, with a few seconds between
-   each try** — see "What went wrong" for why hammering it is dangerous.
-6. If it works, subscribe to the URL from Apple Calendar / Google Calendar /
-   Reminders as described in the repo's `README.md`.
+1. **Subscribe to the URLs** from Apple Calendar / Google Calendar /
+   Reminders, per the repo's `README.md`, if that hasn't been done yet.
+2. **Watch for a real cancelled lesson** at some point during the term and
+   confirm it shows up correctly as `[CANCELLED]` — this logic has never
+   been exercised against real cancellation data, only written against the
+   documented/observed field shape.
+3. Consider adding the Cron Trigger check from the README (it's already in
+   `wrangler.toml`, just confirm it's actually firing every 30 min in the
+   Cloudflare dashboard's Trigger Events tab).
 
 ## Architecture (file by file)
 
@@ -136,29 +133,43 @@ To fix it:
    debug fetch returning `401 Unauthorized, WWW-Authenticate: Bearer
    error="invalid_token", error_description="Token revoked"`. Fixed with a
    short-TTL KV lock (`somtoday_refresh_lock`) so only one refresh happens
-   at a time — but the already-revoked token needed replacing regardless
-   (see "THE ONE THING LEFT TO DO" above). This should not recur under
-   normal usage (infrequent calendar-app polling + a 30-min cron), only
-   under rapid manual testing like what caused it here.
+   at a time. The already-revoked token was replaced with a freshly
+   captured one from the user's browser, and the calendar started returning
+   real data immediately after. Should not recur under normal usage
+   (infrequent calendar-app polling + a 30-min cron), only under rapid
+   manual testing like what caused it here.
+4. **Also caused by the lock**: Cloudflare KV rejects `expirationTtl` below
+   60 seconds. The lock was initially set to 20s and every single
+   `kv.put()` call for it failed with `400 Invalid expiration_ttl`,
+   throwing before the actual token refresh ever ran — meaning even after
+   pasting a *fresh* refresh token, requests kept failing until this was
+   fixed to `expirationTtl: 60`. Found via the (now-removed) debug endpoint
+   surfacing the raw KV error message directly.
+5. **A stale cached access token masked all of the above for a while**:
+   `getAccessTokenFromBootstrap()` checks KV for a cached, not-yet-expired
+   access token before ever touching the refresh token. After the
+   revocation in #3, the (now-invalid) access token was still cached in KV
+   with a future `expires_at`, so the Worker kept returning it — and
+   getting `401`s from Somtoday — without ever attempting to use the fresh
+   refresh token that had just been pasted in. Had to manually delete the
+   `somtoday_tokens` key from the `STATE` KV namespace (Cloudflare
+   dashboard → Storage & databases → Workers KV → STATE) to force it to
+   actually redeem the new refresh token. If this project ever seems stuck
+   returning stale/wrong data despite a secret update, **check and clear
+   this KV key first**.
 
-## Cleanup still to do (low priority, not blocking)
+## Cleanup (done)
 
-- `src/index.ts` has a temporary `handleDebug()` function and the
-  `?debug=1` route, added for this debugging session. It returns JSON with
-  a token prefix (not the full token) and item counts/raw API responses —
-  not a secret leak, but not something a real client needs either. Safe to
-  delete once the fresh token is confirmed working, or safe to leave (it's
-  not user-facing/discoverable without knowing the query param).
-- `src/somtoday-api.ts`'s per-week fetch has `console.log`/`console.error`
-  diagnostic lines added during debugging. Harmless to leave (Workers
-  Observability is opt-in and free-tier capped), but noisy if you enable
-  full logging long-term.
-- `fetchHuiswerk()` in `somtoday-api.ts` has never actually been exercised
-  against the live deployed Worker (only the schedule endpoint has, and
-  only after all the auth fixes). Once the token is fixed, test
-  `/homework.ics` specifically — it's built from a real HAR capture so it
-  *should* work, but hasn't been confirmed end-to-end like `/calendar.ics`
-  has.
+- The temporary `handleDebug()` function and `?debug=1` route have been
+  removed from `src/index.ts`.
+- The diagnostic `console.log`/`console.error` lines in
+  `src/somtoday-api.ts`'s per-week fetch have been removed.
+- `fetchHuiswerk()` has been confirmed working end to end against the live
+  Worker (`/homework.ics` returns real homework items with correct subjects
+  and descriptions).
+
+## Still unverified (not blocking, just untested in practice)
+
 - Cancellation detection (`isUitgevallen` + snapshot diff) has never been
   observed against a real cancelled lesson. Logic is sound but unverified
   in practice — worth checking back once a real cancellation happens during
