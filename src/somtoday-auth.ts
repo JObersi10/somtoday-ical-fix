@@ -180,7 +180,7 @@ async function refresh(refreshToken: string): Promise<TokenSet> {
       client_id: CLIENT_ID,
     }).toString(),
   });
-  if (!res.ok) throw new Error(`Somtoday token refresh failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Somtoday token refresh failed: ${res.status} ${await res.text()}`);
   const json = await res.json<{ access_token: string; refresh_token: string; expires_in: number }>();
   return {
     access_token: json.access_token,
