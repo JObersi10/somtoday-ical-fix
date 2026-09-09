@@ -25,11 +25,19 @@ function requireAuth(req: Request, env: Env): Response | null {
 }
 
 function localWallToUtc(iso: string): Date {
-  // "2026-09-07T07:30:00" -> Date, treating it as Europe/Amsterdam civil time
+  // Somtoday's beginDatumTijd/eindDatumTijd ("2026-09-07T07:30:00", no
+  // offset) is the literal clock number the school schedule uses — e.g.
+  // "07:30" for a first lesson, year-round, since school bell times don't
+  // shift for Dutch DST. Per the user (who actually attends/watches this
+  // schedule from Curacao): that same clock number "07:30" IS the real
+  // Curacao time they operate on — not a Dutch local time that needs
+  // converting via a real UTC offset. So we read these digits directly as
+  // America/Curacao civil time (fixed UTC-4, no DST) rather than
+  // interpreting them as Europe/Amsterdam and computing a real conversion.
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
   if (!m) return new Date(iso);
   const [, y, mo, d, h, mi, s] = m;
-  return zonedWallTimeToUtc(+y, +mo, +d, +h, +mi, +s, "Europe/Amsterdam");
+  return zonedWallTimeToUtc(+y, +mo, +d, +h, +mi, +s, AST_TZ);
 }
 
 function afspraakToVEvent(item: RAfspraakItem, cancelled = false): VEvent {
