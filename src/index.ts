@@ -111,6 +111,22 @@ async function handleDebug(env: Env): Promise<Response> {
     const token = await resolveAccessToken(env);
     out.tokenObtained = true;
     out.tokenPrefix = token.slice(0, 20);
+
+    // Bypass every wrapper: hit the exact URL confirmed live in the HAR
+    // capture directly, with the exact headers, and show the raw response.
+    const rawUrl = `https://api.somtoday.nl/rest/v1/afspraakitems/${env.SOMTODAY_LEERLING_ID}/jaar/2026/week/37`;
+    const rawRes = await fetch(rawUrl, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.topicus.platinum+json; charset=utf-8",
+      },
+    });
+    out.rawUrl = rawUrl;
+    out.rawStatus = rawRes.status;
+    out.rawStatusText = rawRes.statusText;
+    out.rawHeaders = Object.fromEntries(rawRes.headers.entries());
+    out.rawBody = (await rawRes.text()).slice(0, 2000);
+
     const items = await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, token, new Date());
     out.totalItems = items.length;
     out.sampleItems = items.slice(0, 3);
