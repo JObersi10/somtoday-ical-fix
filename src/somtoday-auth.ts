@@ -53,9 +53,18 @@ interface TokenSet {
   expires_at: number; // epoch ms
 }
 
-const TOKEN_ENDPOINT = "https://inloggen.somtoday.nl/oauth2/token";
+// Confirmed live from a real captured refresh_token JWT (2026-09-09):
+// iss "https://somtoday.nl", client_id "somtoday-leerling-web",
+// refresh token lifetime exactly 8 hours (28800s) from issuance. That 8h
+// window — not "nothing was refreshing" — is almost certainly the real
+// reason logins felt like they expired constantly: whatever client you
+// were using wasn't refreshing inside that window. As long as this Worker
+// (via its cron trigger) uses the refresh token at least once every 8
+// hours, Somtoday issues a fresh refresh_token each time (rotation) and
+// the session should never lapse.
+const TOKEN_ENDPOINT = "https://somtoday.nl/oauth2/token";
 const AUTH_ENDPOINT = "https://inloggen.somtoday.nl/oauth2/authorize";
-const CLIENT_ID = "somtoday-leerling-native";
+const CLIENT_ID = "somtoday-leerling-web";
 const REDIRECT_URI = "somtodayleerling://oauth/callback";
 const KV_KEY = "somtoday_tokens";
 

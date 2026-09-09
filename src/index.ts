@@ -82,7 +82,10 @@ async function syncAndCache(env: Env): Promise<string> {
   const { current, cancelled } = await diffAndUpdateSnapshot(env.STATE, items);
 
   const events: VEvent[] = [
-    ...current.map((i) => afspraakToVEvent(i, false)),
+    // isUitgevallen is a confirmed, direct cancellation flag when present;
+    // the snapshot diff (below) is a backstop for lessons that vanish from
+    // the response entirely rather than being flagged in place.
+    ...current.map((i) => afspraakToVEvent(i, i.isUitgevallen === true)),
     ...cancelled.map((c) =>
       afspraakToVEvent(
         { uniqueIdentifier: c.uid, afspraakItemType: "ROOSTER", titel: c.titel, locatie: c.locatie,

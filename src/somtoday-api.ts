@@ -44,6 +44,14 @@ export interface RAfspraakItem {
   vak?: { naam: string; afkorting?: string };
   docentNamen?: string[];
   statusNotifications?: { omschrijving?: string; type?: string }[];
+  /** CONFIRMED live (2026-09-09) — this endpoint's sibling response shape
+   * (the app's own cached `afspraak` payload) carries `isUitgevallen: bool`
+   * directly on each item. This is a real, first-class cancellation flag —
+   * better than the snapshot-diff fallback in snapshot.ts, which is kept
+   * as a backstop for the (separate, unverified-for-this-field)
+   * afspraakitems/{id}/jaar/.../week/... endpoint in case it omits this
+   * field for your tenant. */
+  isUitgevallen?: boolean;
 }
 
 export interface RStudiewijzerItem {
