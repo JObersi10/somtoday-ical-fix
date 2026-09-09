@@ -62,7 +62,9 @@ export async function getAccessTokenFromBootstrap(
     throw new Error("Timed out waiting for a concurrent token refresh to finish.");
   }
 
-  await kv.put(lockKey, "1", { expirationTtl: 20 });
+  // Cloudflare KV requires expirationTtl >= 60s; the lock is deleted in the
+  // `finally` below well before that anyway, this is just a dead-man's switch.
+  await kv.put(lockKey, "1", { expirationTtl: 60 });
   try {
     const rtToUse = stored?.refresh_token || refreshToken;
     const fresh = await refresh(rtToUse);
