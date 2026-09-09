@@ -101,8 +101,29 @@ async function syncAndCache(env: Env): Promise<string> {
   return body;
 }
 
+/** Temporary: GET /calendar.ics?debug=1 returns raw diagnostic JSON instead
+ * of ICS — token status, leerlingId, and per-week item counts. Remove once
+ * the empty-calendar issue is root-caused; not a security concern (no
+ * secrets in the output), but it's not something a real client needs. */
+async function handleDebug(env: Env): Promise<Response> {
+  const out: Record<string, unknown> = { leerlingId: env.SOMTODAY_LEERLING_ID };
+  try {
+    const token = await resolveAccessToken(env);
+    out.tokenObtained = true;
+    out.tokenPrefix = token.slice(0, 20);
+    const items = await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, token, new Date());
+    out.totalItems = items.length;
+    out.sampleItems = items.slice(0, 3);
+  } catch (err) {
+    out.error = err instanceof Error ? err.message : String(err);
+    out.stack = err instanceof Error ? err.stack : undefined;
+  }
+  return new Response(JSON.stringify(out, null, 2), { headers: { "Content-Type": "application/json" } });
+}
+
 async function handleCalendar(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
+  if (url.searchParams.get("debug") === "1") return handleDebug(env);
 
   // Mode A: authenticated Somtoday API — real cancellations + homework.
   if (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) {
