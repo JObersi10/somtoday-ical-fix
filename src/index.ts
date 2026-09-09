@@ -114,8 +114,10 @@ async function handleCalendar(req: Request, env: Env): Promise<Response> {
     } catch (err) {
       // Degrade gracefully: serve the last known-good calendar (if any) with
       // a warning event, instead of a hard failure — token refresh issues
-      // shouldn't nuke your whole calendar mid-week.
-      const cached = await env.STATE.get("last_good_ics");
+      // shouldn't nuke your whole calendar mid-week. Guard env.STATE itself
+      // being missing (e.g. a misconfigured binding) so this fallback path
+      // can never itself throw an uncaught exception.
+      const cached = env.STATE ? await env.STATE.get("last_good_ics") : null;
       if (cached) {
         const warning = serializeIcs(
           [{
