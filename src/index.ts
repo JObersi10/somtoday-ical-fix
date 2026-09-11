@@ -2,6 +2,7 @@ import { parseIcs, serializeIcs, serializeVTodos, zonedWallTimeToUtc, type VEven
 import { fetchAfspraken, fetchHuiswerk, type RAfspraakItem } from "./somtoday-api";
 import { getAccessTokenFromBootstrap, getAccessToken, type SomtodayCreds } from "./somtoday-auth";
 import { diffAndUpdateSnapshot } from "./snapshot";
+import { notify } from "./notify";
 
 export interface Env {
   STATE: KVNamespace;
@@ -14,6 +15,7 @@ export interface Env {
   SOMTODAY_TENANT?: string;
   HOMEWORK_HOUR?: string; // local AST hour, default "16"
   CAL_TOKEN?: string; // optional shared secret to keep the URL private
+  NTFY_TOPIC?: string; // ntfy.sh topic for cancellation + sync-failure push notifications
 }
 
 const AST_TZ = "America/Curacao"; // fixed UTC-4, no DST
@@ -85,29 +87,97 @@ async function resolveAccessToken(env: Env): Promise<string> {
  * handler below, so a background cron run (with no calendar app waiting on
  * it) keeps the cancellation-diff snapshot warm even between your app's own
  * polls, and refreshes the access token on its own schedule too. */
+/** Push a notification for each newly-cancelled lesson, deduped so a lesson
+ * flagged in-place via isUitgevallen (which stays true on every subsequent
+ * fetch until the lesson's time passes) only fires once. The snapshot-diff
+ * path (items that vanish entirely) is naturally one-shot already — see
+ * snapshot.ts, a vanished UID is deleted from the index the moment it's
+ * reported, so it can't be reported twice. */
+async function notifyCancellations(env: Env, current: RAfspraakItem[], cancelled: { titel: string; vak?: string; beginDatumTijd: string }[]): Promise<void> {
+  if (!env.NTFY_TOPIC) return;
+
+  for (const item of current) {
+    if (item.isUitgevallen !== true) continue;
+    const flagKey = `notified:${item.uniqueIdentifier}`;
+    if (await env.STATE.get(flagKey)) continue;
+    await env.STATE.put(flagKey, "1", { expirationTtl: 4 * 24 * 3600 });
+    await notify(
+      env.NTFY_TOPIC,
+      "Lesson cancelled",
+      `${item.vak?.naam ?? item.titel} — ${item.beginDatumTijd.replace("T", " ")}`,
+      { priority: "high", tags: ["x"] }
+    );
+  }
+
+  for (const c of cancelled) {
+    await notify(
+      env.NTFY_TOPIC,
+      "Lesson cancelled",
+      `${c.vak ?? c.titel} — ${c.beginDatumTijd.replace("T", " ")}`,
+      { priority: "high", tags: ["x"] }
+    );
+  }
+}
+
+const FAIL_STREAK_KEY = "sync_fail_streak";
+const FAIL_ALERTED_KEY = "sync_alerted";
+const FAIL_ALERT_THRESHOLD = 2; // consecutive failed cron runs before paging you (avoids noise from one-off blips)
+
+async function reportSyncOutcome(env: Env, ok: boolean, errMessage?: string): Promise<void> {
+  if (!env.NTFY_TOPIC) return;
+  if (ok) {
+    const wasAlerted = await env.STATE.get(FAIL_ALERTED_KEY);
+    if (wasAlerted) {
+      await notify(env.NTFY_TOPIC, "Somtoday sync recovered", "Back to syncing normally.", { priority: "default", tags: ["white_check_mark"] });
+    }
+    await env.STATE.delete(FAIL_STREAK_KEY);
+    await env.STATE.delete(FAIL_ALERTED_KEY);
+    return;
+  }
+  const streak = (Number(await env.STATE.get(FAIL_STREAK_KEY)) || 0) + 1;
+  await env.STATE.put(FAIL_STREAK_KEY, String(streak), { expirationTtl: 7 * 24 * 3600 });
+  if (streak >= FAIL_ALERT_THRESHOLD && !(await env.STATE.get(FAIL_ALERTED_KEY))) {
+    await env.STATE.put(FAIL_ALERTED_KEY, "1", { expirationTtl: 7 * 24 * 3600 });
+    await notify(
+      env.NTFY_TOPIC,
+      "Somtoday sync is failing",
+      `Failed ${streak} syncs in a row. Last error: ${errMessage ?? "unknown"}`,
+      { priority: "urgent", tags: ["warning"] }
+    );
+  }
+}
+
 async function syncAndCache(env: Env): Promise<string> {
-  const token = await resolveAccessToken(env);
-  const items = await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, token, new Date());
-  const { current, cancelled } = await diffAndUpdateSnapshot(env.STATE, items);
+  try {
+    const token = await resolveAccessToken(env);
+    const items = await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, token, new Date());
+    const { current, cancelled } = await diffAndUpdateSnapshot(env.STATE, items);
 
-  const events: VEvent[] = [
-    // isUitgevallen is a confirmed, direct cancellation flag when present;
-    // the snapshot diff (below) is a backstop for lessons that vanish from
-    // the response entirely rather than being flagged in place.
-    ...current.map((i) => afspraakToVEvent(i, i.isUitgevallen === true)),
-    ...cancelled.map((c) =>
-      afspraakToVEvent(
-        { uniqueIdentifier: c.uid, afspraakItemType: "ROOSTER", titel: c.titel, locatie: c.locatie,
-          beginDatumTijd: c.beginDatumTijd, eindDatumTijd: c.eindDatumTijd,
-          vak: c.vak ? { naam: c.vak } : undefined },
-        true
-      )
-    ),
-  ];
+    const events: VEvent[] = [
+      // isUitgevallen is a confirmed, direct cancellation flag when present;
+      // the snapshot diff (below) is a backstop for lessons that vanish from
+      // the response entirely rather than being flagged in place.
+      ...current.map((i) => afspraakToVEvent(i, i.isUitgevallen === true)),
+      ...cancelled.map((c) =>
+        afspraakToVEvent(
+          { uniqueIdentifier: c.uid, afspraakItemType: "ROOSTER", titel: c.titel, locatie: c.locatie,
+            beginDatumTijd: c.beginDatumTijd, eindDatumTijd: c.eindDatumTijd,
+            vak: c.vak ? { naam: c.vak } : undefined },
+          true
+        )
+      ),
+    ];
 
-  const body = serializeIcs(events, { calname: "Somtoday (AST)" });
-  await env.STATE.put("last_good_ics", body, { expirationTtl: 7 * 24 * 3600 });
-  return body;
+    const body = serializeIcs(events, { calname: "Somtoday (AST)" });
+    await env.STATE.put("last_good_ics", body, { expirationTtl: 7 * 24 * 3600 });
+
+    await notifyCancellations(env, current, cancelled.map((c) => ({ titel: c.titel, vak: c.vak, beginDatumTijd: c.beginDatumTijd })));
+    await reportSyncOutcome(env, true);
+    return body;
+  } catch (err) {
+    await reportSyncOutcome(env, false, err instanceof Error ? err.message : String(err));
+    throw err;
+  }
 }
 
 async function handleCalendar(req: Request, env: Env): Promise<Response> {
