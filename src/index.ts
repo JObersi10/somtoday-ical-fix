@@ -339,6 +339,34 @@ async function handleSyncNow(env: Env): Promise<Response> {
   });
 }
 
+/** Temporary: raw PROPFIND from inside the Worker runtime itself, to compare
+ * against the same request made via curl (which succeeds). Remove once the
+ * CalDAV 400 is diagnosed — see HANDOFF.md. */
+async function handleCalDavDebug(env: Env): Promise<Response> {
+  if (!env.ICLOUD_APPLE_ID || !env.ICLOUD_APP_PASSWORD) {
+    return new Response("ICLOUD_APPLE_ID/ICLOUD_APP_PASSWORD not set", { status: 400 });
+  }
+  const auth = "Basic " + btoa(`${env.ICLOUD_APPLE_ID}:${env.ICLOUD_APP_PASSWORD}`);
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<A:propfind xmlns:A="DAV:">
+  <A:prop><A:current-user-principal/></A:prop>
+</A:propfind>`;
+  const res = await fetch("https://caldav.icloud.com/", {
+    method: "PROPFIND",
+    headers: {
+      Authorization: auth,
+      Depth: "0",
+      "Content-Type": "application/xml; charset=utf-8",
+    },
+    body,
+  });
+  const text = await res.text();
+  return new Response(
+    JSON.stringify({ status: res.status, headers: Object.fromEntries(res.headers), body: text }, null, 2),
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -348,6 +376,7 @@ export default {
     if (url.pathname === "/calendar.ics") return handleCalendar(req, env);
     if (url.pathname === "/homework.ics") return handleHomework(req, env);
     if (url.pathname === "/sync-now") return handleSyncNow(env);
+    if (url.pathname === "/caldav-debug") return handleCalDavDebug(env);
     if (url.pathname === "/") {
       return new Response(
         "somtoday-fix worker.\n\nEndpoints:\n  /calendar.ics\n  /homework.ics\n  /sync-now (manual trigger)\n\nSee README for setup.",
