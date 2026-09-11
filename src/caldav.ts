@@ -38,14 +38,24 @@ function splitResponses(xml: string): string[] {
 async function propfind(
   url: string, appleId: string, appPassword: string, depth: "0" | "1", body: string
 ): Promise<string> {
+  // Cloudflare Workers' fetch sends a plain string body as
+  // Transfer-Encoding: chunked (no Content-Length) by default. iCloud's
+  // CalDAV/WebDAV server rejects chunked PROPFIND bodies with a bare 400 —
+  // confirmed by comparing an identical request made via curl (which sends
+  // Content-Length and succeeds) against the same request from inside this
+  // Worker (fails every time). Encoding the body as a fixed-size buffer
+  // gives fetch() a known length upfront, so it sends Content-Length
+  // instead of chunking.
+  const bytes = new TextEncoder().encode(body);
   const res = await fetch(url, {
     method: "PROPFIND",
     headers: {
       Authorization: authHeader(appleId, appPassword),
       Depth: depth,
       "Content-Type": "application/xml; charset=utf-8",
+      "Content-Length": String(bytes.byteLength),
     },
-    body,
+    body: bytes,
   });
   if (!res.ok && res.status !== 207) {
     throw new Error(`CalDAV PROPFIND ${url} -> ${res.status}: ${await res.text()}`);
@@ -164,15 +174,16 @@ export async function ensureReminder(
   const head = await fetch(url, { method: "HEAD", headers: { Authorization: authHeader(appleId, appPassword) } });
   if (head.status === 200) return "exists";
 
-  const body = buildVTodoIcs(uid, summary, description, due);
+  const bodyBytes = new TextEncoder().encode(buildVTodoIcs(uid, summary, description, due));
   const put = await fetch(url, {
     method: "PUT",
     headers: {
       Authorization: authHeader(appleId, appPassword),
       "Content-Type": "text/calendar; charset=utf-8",
+      "Content-Length": String(bodyBytes.byteLength),
       "If-None-Match": "*",
     },
-    body,
+    body: bodyBytes,
   });
   if (put.ok) return "created";
   if (put.status === 412) return "exists"; // lost the create race to another run — fine
