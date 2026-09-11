@@ -31,6 +31,13 @@ SOMTODAY_CLIENT_ID = "somtoday-leerling-native"
 # src/notify.ts). Not a real secret, but keep it out of anything public —
 # anyone who knows the topic name can publish fake notifications to it.
 NTFY_TOPIC = "somtoday-jaden-4d9ea36b"
+# CalDAV homework->Reminders sync (see src/caldav.ts). These two were
+# originally added as dashboard-only Variables and got silently wiped by
+# the very next git-triggered deploy — the exact gotcha described in the
+# comment above SOMTODAY_LEERLING_ID. Moved here for the same reason.
+# The actual credential (ICLOUD_APP_PASSWORD) stays a dashboard Secret.
+ICLOUD_APPLE_ID = "obersi@gmail.com"
+REMINDERS_LIST_NAME = "Homework"
 
 # Runs the sync automatically every 30 minutes, independent of whether your
 # calendar app happens to be polling — this is what "runs automatically"
