@@ -179,6 +179,7 @@ async function syncAndCache(env: Env): Promise<string> {
 
     const body = serializeIcs(events, { calname: "Somtoday (AST)" });
     await env.STATE.put("last_good_ics", body, { expirationTtl: 7 * 24 * 3600 });
+    await env.STATE.put("last_full_sync_at", String(Date.now()), { expirationTtl: 7 * 24 * 3600 });
 
     await notifyCancellations(env, current, cancelled.map((c) => ({ titel: c.titel, vak: c.vak, beginDatumTijd: c.beginDatumTijd })));
     await reportSyncOutcome(env, "cal", "Somtoday calendar sync", true);
@@ -232,11 +233,29 @@ async function syncHomeworkToReminders(env: Env): Promise<void> {
   }
 }
 
+const CALENDAR_COOLDOWN_MS = 15 * 60 * 1000;
+
 async function handleCalendar(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
 
   // Mode A: authenticated Somtoday API — real cancellations + homework.
   if (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) {
+    // Every hit to this endpoint (e.g. Calendar.app opening/refreshing) used
+    // to trigger a full live Somtoday fetch + KV write with zero throttling —
+    // fine occasionally, wasteful if the app polls repeatedly in a short
+    // window (and a real contributor to the KV daily-write-limit incident,
+    // see HANDOFF.md). A 15-minute cooldown: serve the cached result
+    // instantly within the window, do a real fresh sync once it's passed.
+    // The cron's hourly tick is unaffected — this only gates the on-demand
+    // HTTP path, and /sync-now always forces a real sync regardless.
+    const lastSyncAt = Number(await env.STATE.get("last_full_sync_at")) || 0;
+    const cachedFresh = await env.STATE.get("last_good_ics");
+    if (cachedFresh && Date.now() - lastSyncAt < CALENDAR_COOLDOWN_MS) {
+      return new Response(cachedFresh, {
+        headers: { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "no-cache" },
+      });
+    }
+
     try {
       const body = await syncAndCache(env);
       return new Response(body, {
