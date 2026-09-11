@@ -39,12 +39,19 @@ NTFY_TOPIC = "somtoday-jaden-4d9ea36b"
 ICLOUD_APPLE_ID = "obersi@gmail.com"
 REMINDERS_LIST_NAME = "Homework"
 
-# Runs the sync automatically every 30 minutes, independent of whether your
+# Runs the sync automatically once an hour, independent of whether your
 # calendar app happens to be polling — this is what "runs automatically"
 # means here: no server to keep alive, Cloudflare just invokes scheduled()
-# on this cadence forever, for free (well within the free tier's limits).
+# on this cadence forever, for free. Was every 30 min; dropped to hourly
+# to stay well clear of Cloudflare KV's free-tier 1,000 writes/day limit
+# (see HANDOFF.md for the incident where the old per-lesson KV write
+# pattern blew through that limit even at the 30-min cadence). Opening
+# Calendar.app itself also triggers a fresh sync independently of this —
+# /calendar.ics runs syncAndCache() on every HTTP request, not just cron —
+# though iOS decides on its own, often conservatively, when to actually
+# poll a subscribed calendar in the background.
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["0 * * * *"]
 
 # All secrets below are set with:  wrangler secret put NAME
 # (or pasted into Settings -> Variables and Secrets in the dashboard)
