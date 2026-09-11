@@ -312,6 +312,33 @@ async function handleHomework(req: Request, env: Env): Promise<Response> {
   return new Response(body, { headers: { "Content-Type": "text/calendar; charset=utf-8" } });
 }
 
+/** Manual trigger — runs the same two syncs the cron does, right now, and
+ * reports what happened instead of making you wait up to 30 minutes and
+ * then go check Reminders/ntfy to find out. Gated behind CAL_TOKEN when
+ * that's set, same as the calendar/homework routes. */
+async function handleSyncNow(env: Env): Promise<Response> {
+  const result: Record<string, { ok: boolean; error?: string }> = {};
+
+  try {
+    await syncAndCache(env);
+    result.calendar = { ok: true };
+  } catch (err) {
+    result.calendar = { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  try {
+    await syncHomeworkToReminders(env);
+    result.reminders = { ok: true };
+  } catch (err) {
+    result.reminders = { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  return new Response(JSON.stringify(result, null, 2), {
+    headers: { "Content-Type": "application/json" },
+    status: result.calendar.ok && result.reminders.ok ? 200 : 207,
+  });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -320,9 +347,10 @@ export default {
 
     if (url.pathname === "/calendar.ics") return handleCalendar(req, env);
     if (url.pathname === "/homework.ics") return handleHomework(req, env);
+    if (url.pathname === "/sync-now") return handleSyncNow(env);
     if (url.pathname === "/") {
       return new Response(
-        "somtoday-fix worker.\n\nEndpoints:\n  /calendar.ics\n  /homework.ics\n\nSee README for setup.",
+        "somtoday-fix worker.\n\nEndpoints:\n  /calendar.ics\n  /homework.ics\n  /sync-now (manual trigger)\n\nSee README for setup.",
         { headers: { "Content-Type": "text/plain" } }
       );
     }
