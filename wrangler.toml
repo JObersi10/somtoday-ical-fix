@@ -21,6 +21,16 @@ kv_namespaces = [
 # Add variable -> type "Secret". That one does persist across deploys.
 [vars]
 SOMTODAY_LEERLING_ID = "7361428924143"
+# Must match whichever client the SOMTODAY_REFRESH_TOKEN secret was actually
+# issued to. Currently the mobile app's native client (60-day refresh token
+# lifetime, vs. 8 hours for "somtoday-leerling-web"). Belongs here, not just
+# a dashboard Variable, for the same reason as SOMTODAY_LEERLING_ID above —
+# see HANDOFF.md for the incident where this got silently wiped by a deploy.
+SOMTODAY_CLIENT_ID = "somtoday-leerling-native"
+# ntfy.sh topic for cancellation + sync-failure push notifications (see
+# src/notify.ts). Not a real secret, but keep it out of anything public —
+# anyone who knows the topic name can publish fake notifications to it.
+NTFY_TOPIC = "somtoday-jaden-4d9ea36b"
 
 # Runs the sync automatically every 30 minutes, independent of whether your
 # calendar app happens to be polling — this is what "runs automatically"
