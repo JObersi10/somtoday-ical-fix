@@ -3,6 +3,7 @@ import { fetchAfspraken, fetchHuiswerk, type RAfspraakItem } from "./somtoday-ap
 import { getAccessTokenFromBootstrap, getAccessToken, type SomtodayCreds } from "./somtoday-auth";
 import { diffAndUpdateSnapshot } from "./snapshot";
 import { notify } from "./notify";
+import { discoverReminderList, ensureReminder } from "./caldav";
 
 export interface Env {
   STATE: KVNamespace;
@@ -16,6 +17,9 @@ export interface Env {
   HOMEWORK_HOUR?: string; // local AST hour, default "16"
   CAL_TOKEN?: string; // optional shared secret to keep the URL private
   NTFY_TOPIC?: string; // ntfy.sh topic for cancellation + sync-failure push notifications
+  ICLOUD_APPLE_ID?: string; // Apple ID email, for CalDAV homework -> Reminders sync
+  ICLOUD_APP_PASSWORD?: string; // app-specific password (appleid.apple.com -> Sign-In and Security)
+  REMINDERS_LIST_NAME?: string; // Reminders.app list to sync into, default "Homework" — create it once yourself
 }
 
 const AST_TZ = "America/Curacao"; // fixed UTC-4, no DST
@@ -119,29 +123,34 @@ async function notifyCancellations(env: Env, current: RAfspraakItem[], cancelled
   }
 }
 
-const FAIL_STREAK_KEY = "sync_fail_streak";
-const FAIL_ALERTED_KEY = "sync_alerted";
-const FAIL_ALERT_THRESHOLD = 2; // consecutive failed cron runs before paging you (avoids noise from one-off blips)
+const FAIL_ALERT_THRESHOLD = 2; // consecutive failed runs before paging you (avoids noise from one-off blips)
 
-async function reportSyncOutcome(env: Env, ok: boolean, errMessage?: string): Promise<void> {
+/** Generic consecutive-failure tracker + ntfy alerting, shared by the
+ * calendar sync and the Reminders sync so a break in either one pages you
+ * (after a couple of consecutive misses, not the first blip) and a single
+ * "recovered" notification fires once it's working again. `keyPrefix` keeps
+ * the two trackers from stepping on each other's KV state. */
+async function reportSyncOutcome(env: Env, keyPrefix: string, label: string, ok: boolean, errMessage?: string): Promise<void> {
   if (!env.NTFY_TOPIC) return;
+  const streakKey = `${keyPrefix}_fail_streak`;
+  const alertedKey = `${keyPrefix}_alerted`;
   if (ok) {
-    const wasAlerted = await env.STATE.get(FAIL_ALERTED_KEY);
+    const wasAlerted = await env.STATE.get(alertedKey);
     if (wasAlerted) {
-      await notify(env.NTFY_TOPIC, "Somtoday sync recovered", "Back to syncing normally.", { priority: "default", tags: ["white_check_mark"] });
+      await notify(env.NTFY_TOPIC, `${label} recovered`, "Back to syncing normally.", { priority: "default", tags: ["white_check_mark"] });
     }
-    await env.STATE.delete(FAIL_STREAK_KEY);
-    await env.STATE.delete(FAIL_ALERTED_KEY);
+    await env.STATE.delete(streakKey);
+    await env.STATE.delete(alertedKey);
     return;
   }
-  const streak = (Number(await env.STATE.get(FAIL_STREAK_KEY)) || 0) + 1;
-  await env.STATE.put(FAIL_STREAK_KEY, String(streak), { expirationTtl: 7 * 24 * 3600 });
-  if (streak >= FAIL_ALERT_THRESHOLD && !(await env.STATE.get(FAIL_ALERTED_KEY))) {
-    await env.STATE.put(FAIL_ALERTED_KEY, "1", { expirationTtl: 7 * 24 * 3600 });
+  const streak = (Number(await env.STATE.get(streakKey)) || 0) + 1;
+  await env.STATE.put(streakKey, String(streak), { expirationTtl: 7 * 24 * 3600 });
+  if (streak >= FAIL_ALERT_THRESHOLD && !(await env.STATE.get(alertedKey))) {
+    await env.STATE.put(alertedKey, "1", { expirationTtl: 7 * 24 * 3600 });
     await notify(
       env.NTFY_TOPIC,
-      "Somtoday sync is failing",
-      `Failed ${streak} syncs in a row. Last error: ${errMessage ?? "unknown"}`,
+      `${label} is failing`,
+      `Failed ${streak} runs in a row. Last error: ${errMessage ?? "unknown"}`,
       { priority: "urgent", tags: ["warning"] }
     );
   }
@@ -172,10 +181,53 @@ async function syncAndCache(env: Env): Promise<string> {
     await env.STATE.put("last_good_ics", body, { expirationTtl: 7 * 24 * 3600 });
 
     await notifyCancellations(env, current, cancelled.map((c) => ({ titel: c.titel, vak: c.vak, beginDatumTijd: c.beginDatumTijd })));
-    await reportSyncOutcome(env, true);
+    await reportSyncOutcome(env, "cal", "Somtoday calendar sync", true);
     return body;
   } catch (err) {
-    await reportSyncOutcome(env, false, err instanceof Error ? err.message : String(err));
+    await reportSyncOutcome(env, "cal", "Somtoday calendar sync", false, err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+}
+
+function homeworkDue(hw: { datumTijd?: string }, hour: number): Date {
+  // Due = the day BEFORE the linked lesson, at `hour` AST. hw.datumTijd
+  // carries an explicit offset, so the native Date parser already gets the
+  // correct UTC instant for the lesson itself.
+  const lessonDate = hw.datumTijd ? new Date(hw.datumTijd) : new Date();
+  const dueLocal = new Date(lessonDate);
+  dueLocal.setUTCDate(dueLocal.getUTCDate() - 1);
+  const y = dueLocal.getUTCFullYear(), mo = dueLocal.getUTCMonth() + 1, d = dueLocal.getUTCDate();
+  return zonedWallTimeToUtc(y, mo, d, hour, 0, 0, AST_TZ);
+}
+
+/** Push homework into a real iCloud Reminders list via CalDAV — see
+ * caldav.ts for why this gets a checkable Reminders item where the
+ * calendar.ics VTODO route (still served for non-Apple clients) cannot.
+ * Create-only: never touches an item that already exists, so checking
+ * something off in Reminders.app sticks. */
+async function syncHomeworkToReminders(env: Env): Promise<void> {
+  if (!env.ICLOUD_APPLE_ID || !env.ICLOUD_APP_PASSWORD) return;
+  const listName = env.REMINDERS_LIST_NAME || "Homework";
+  try {
+    const hour = Number(env.HOMEWORK_HOUR ?? "16");
+    const token = await resolveAccessToken(env);
+    const huiswerk = await fetchHuiswerk(env.SOMTODAY_LEERLING_ID!, token, new Date());
+    const target = await discoverReminderList(env.STATE, env.ICLOUD_APPLE_ID, env.ICLOUD_APP_PASSWORD, listName);
+
+    for (const hw of huiswerk) {
+      const typeTag = hw.huiswerkType && hw.huiswerkType !== "HUISWERK" ? ` [${hw.huiswerkType}]` : "";
+      const plainDesc = hw.omschrijving?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      await ensureReminder(
+        target, env.ICLOUD_APPLE_ID, env.ICLOUD_APP_PASSWORD,
+        `${hw.uniqueIdentifier}-somtoday-fix-hw`,
+        `${hw.vak?.naam || "?"} - ${hw.onderwerp || "opdracht"}${typeTag}`,
+        plainDesc,
+        homeworkDue(hw, hour)
+      );
+    }
+    await reportSyncOutcome(env, "reminders", "Reminders homework sync", true);
+  } catch (err) {
+    await reportSyncOutcome(env, "reminders", "Reminders homework sync", false, err instanceof Error ? err.message : String(err));
     throw err;
   }
 }
@@ -244,15 +296,7 @@ async function handleHomework(req: Request, env: Env): Promise<Response> {
   const huiswerk = await fetchHuiswerk(env.SOMTODAY_LEERLING_ID, token, new Date());
 
   const todos: VTodo[] = huiswerk.map((hw) => {
-    // Due = the day BEFORE the linked lesson, at `hour` AST.
-    // hw.datumTijd carries an explicit offset (e.g. "...+02:00"), so the
-    // native Date parser already gets the correct UTC instant.
-    const lessonDate = hw.datumTijd ? new Date(hw.datumTijd) : new Date();
-    const dueLocal = new Date(lessonDate);
-    dueLocal.setUTCDate(dueLocal.getUTCDate() - 1);
-    const y = dueLocal.getUTCFullYear(), mo = dueLocal.getUTCMonth() + 1, d = dueLocal.getUTCDate();
-    const due = zonedWallTimeToUtc(y, mo, d, hour, 0, 0, AST_TZ);
-
+    const due = homeworkDue(hw, hour);
     const typeTag = hw.huiswerkType && hw.huiswerkType !== "HUISWERK" ? ` [${hw.huiswerkType}]` : "";
     const plainDesc = hw.omschrijving?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
@@ -294,6 +338,14 @@ export default {
     ctx.waitUntil(
       syncAndCache(env).catch((err) => {
         console.error("scheduled sync failed:", err instanceof Error ? err.message : err);
+      })
+    );
+    // Independent of the calendar sync above — a Reminders/CalDAV failure
+    // (e.g. a revoked app-specific password) must never block the calendar
+    // from updating, and vice versa.
+    ctx.waitUntil(
+      syncHomeworkToReminders(env).catch((err) => {
+        console.error("scheduled reminders sync failed:", err instanceof Error ? err.message : err);
       })
     );
   },
