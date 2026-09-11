@@ -33,7 +33,7 @@ export interface SomtodayCreds {
  * depend on us correctly replaying Somtoday's login form, which varies by
  * school and can include SSO we can't automate at all. */
 export async function getAccessTokenFromBootstrap(
-  kv: KVNamespace, refreshToken: string
+  kv: KVNamespace, refreshToken: string, clientId: string = CLIENT_ID
 ): Promise<string> {
   const stored = await kv.get<{ access_token: string; refresh_token: string; expires_at: number }>(
     "somtoday_tokens", "json"
@@ -67,7 +67,7 @@ export async function getAccessTokenFromBootstrap(
   await kv.put(lockKey, "1", { expirationTtl: 60 });
   try {
     const rtToUse = stored?.refresh_token || refreshToken;
-    const fresh = await refresh(rtToUse);
+    const fresh = await refresh(rtToUse, clientId);
     await kv.put("somtoday_tokens", JSON.stringify(fresh));
     return fresh.access_token;
   } finally {
@@ -92,6 +92,17 @@ interface TokenSet {
 // the session should never lapse.
 const TOKEN_ENDPOINT = "https://somtoday.nl/oauth2/token";
 const AUTH_ENDPOINT = "https://inloggen.somtoday.nl/oauth2/authorize";
+// Two known real client_ids (both confirmed from the app's own bundled JS):
+//   "somtoday-leerling-web"    — the browser/web client (used by default)
+//   "somtoday-leerling-native" — the mobile app's Capacitor WebView client,
+//     confirmed 2026-09-11 from the app's own compiled JS (idpClientId getter:
+//     `isNative ? "somtoday-leerling-native" : "somtoday-leerling-web"`),
+//     redirect_uri "somtoday://nl.topicus.somtoday.leerling/oauth/callback",
+//     scope "openid profile". A refresh_token is bound to the client_id it
+//     was issued under — you can't swap client_id on an existing web token,
+//     you need a token actually issued to the native client (captured from
+//     a real logged-in mobile app session). Pass SOMTODAY_CLIENT_ID env var
+//     as "somtoday-leerling-native" when using a mobile-captured token.
 const CLIENT_ID = "somtoday-leerling-web";
 const REDIRECT_URI = "somtodayleerling://oauth/callback";
 const KV_KEY = "somtoday_tokens";
@@ -198,14 +209,14 @@ async function passwordLogin(creds: SomtodayCreds): Promise<TokenSet> {
   };
 }
 
-async function refresh(refreshToken: string): Promise<TokenSet> {
+async function refresh(refreshToken: string, clientId: string = CLIENT_ID): Promise<TokenSet> {
   const res = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: CLIENT_ID,
+      client_id: clientId,
     }).toString(),
   });
   if (!res.ok) throw new Error(`Somtoday token refresh failed: ${res.status} ${await res.text()}`);

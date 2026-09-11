@@ -8,6 +8,7 @@ export interface Env {
   SOMTODAY_ICAL_URL?: string;
   SOMTODAY_LEERLING_ID?: string;
   SOMTODAY_REFRESH_TOKEN?: string; // manual bootstrap (recommended)
+  SOMTODAY_CLIENT_ID?: string; // "somtoday-leerling-web" (default) or "somtoday-leerling-native" — must match whichever client the refresh token above was actually issued to
   SOMTODAY_USERNAME?: string; // experimental password-login fallback
   SOMTODAY_PASSWORD?: string;
   SOMTODAY_TENANT?: string;
@@ -66,7 +67,7 @@ function afspraakToVEvent(item: RAfspraakItem, cancelled = false): VEvent {
 
 async function resolveAccessToken(env: Env): Promise<string> {
   if (env.SOMTODAY_REFRESH_TOKEN) {
-    return getAccessTokenFromBootstrap(env.STATE, env.SOMTODAY_REFRESH_TOKEN);
+    return getAccessTokenFromBootstrap(env.STATE, env.SOMTODAY_REFRESH_TOKEN, env.SOMTODAY_CLIENT_ID);
   }
   if (env.SOMTODAY_USERNAME && env.SOMTODAY_PASSWORD && env.SOMTODAY_TENANT) {
     const creds: SomtodayCreds = {
