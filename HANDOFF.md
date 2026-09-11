@@ -10,6 +10,14 @@ app's OAuth client (60-day refresh token, see below) instead of the web
 client's 8-hour one, which was the actual root cause of "keeps
 logging me out."
 
+**Also as of 2026-09-11, late in the day**: a real production incident hit
+and was fixed — Cloudflare KV's free-tier 1,000-writes/day limit got
+exhausted from normal operation (not just testing), taking down the
+calendar sync itself for the rest of that day. Root cause, fix, and the
+resulting cadence changes (cron dropped to hourly, a 15-min cooldown added
+on `/calendar.ics`) are documented in "KV write-limit incident" below —
+read it before changing sync frequency or KV usage patterns again.
+
 ## What this is
 
 A Cloudflare Worker at repo [JObersi10/somtoday-ical-fix](https://github.com/JObersi10/somtoday-ical-fix),
@@ -25,9 +33,14 @@ cancellation data at all. It produces:
 - `/homework.ics` — VTODO feed, one task per homework item, due the day
   before its linked lesson. (Apple's generic calendar-subscription mechanism
   won't surface these in Reminders.app — see below for the real fix.)
-- A `scheduled()` cron (every 30 min) that keeps the calendar/homework data
-  warm, refreshes the Somtoday token, pushes cancellation/failure
-  notifications, and writes real Reminders items via CalDAV.
+- A `scheduled()` cron (hourly — was every 30 min, see "KV write-limit
+  incident" below) that keeps the calendar/homework data warm, refreshes the
+  Somtoday token, pushes cancellation/failure notifications, and writes real
+  Reminders items via CalDAV.
+- `/sync-now` — manual trigger, runs both syncs immediately and returns
+  per-sync success/failure as JSON, instead of waiting up to an hour and
+  then checking Reminders/ntfy to find out. Always forces a real sync,
+  ignoring the 15-min cooldown described below.
 
 ## Homework in Reminders: real CalDAV (Option B) — implemented, not yet confirmed working (see "Still unverified" below)
 
@@ -78,6 +91,51 @@ your phone. No API key on either side. Two things trigger a push:
    single transient blip — then sends one "recovered" push once it's working
    again. The two trackers are independent (a Reminders outage won't mask a
    calendar outage or vice versa).
+
+## KV write-limit incident (2026-09-11) — read before touching sync frequency
+
+Cloudflare Workers KV's free tier caps at **1,000 writes/day, account-wide,
+hard limit**. Once hit, every `kv.put()` call fails outright
+(`"KV put() limit exceeded for the day"`) until it resets at UTC midnight —
+there is no way to force past it short of upgrading to the Workers Paid
+plan (~$5/mo, raises it to 100,000/day). This hit in production and briefly
+took down `/calendar.ics` itself (not just the new CalDAV feature) on
+2026-09-11, for two compounding reasons:
+
+1. **`snapshot.ts` was writing one `snap:<uid>` KV key per lesson (~65) on
+   every single sync**, not just when something changed. At the old 30-min
+   cron cadence that's ~65 × 48 = ~3,120 writes/day — already 3x over the
+   limit from completely normal operation, independent of any manual
+   testing. **Fixed**: the whole snapshot is now one combined JSON blob
+   under a single key (`snap:all`), cutting this to one write per sync
+   regardless of lesson count.
+2. Heavy manual testing that same day (repeatedly hitting `/sync-now` and a
+   temporary debug endpoint while diagnosing the CalDAV 400, see below) used
+   up a lot of the remaining daily budget fast.
+
+Additional headroom added on top of the snapshot.ts fix, so this has real
+margin rather than just barely fitting under 1,000/day again:
+
+- **Cron dropped from every 30 min to hourly** (`wrangler.toml [triggers]`).
+- **A 15-minute cooldown was added to `/calendar.ics`** (`CALENDAR_COOLDOWN_MS`
+  in `src/index.ts`): a request within 15 min of the last real sync gets the
+  cached `last_good_ics` instantly, with no live Somtoday fetch or KV write;
+  past 15 min, it does a real fresh sync. This matters because
+  Calendar.app opening/refreshing hits this endpoint directly and, before
+  this, triggered a full live sync with zero throttling on every single
+  request. `/sync-now` and the cron's `scheduled()` handler both bypass this
+  cooldown deliberately — only the on-demand HTTP path is gated.
+
+With these three changes combined, expected steady-state usage is roughly
+24 (hourly cron) + a handful of on-demand `/calendar.ics` hits per day, each
+using ~1-6 KV writes — on the order of 100-150 writes/day, comfortably clear
+of the 1,000/day limit even accounting for occasional manual `/sync-now`
+checks. **If this happens again**: check whether something is calling
+`syncAndCache()` or `syncHomeworkToReminders()` in a tight loop (manual
+testing, a misbehaving client polling `/calendar.ics` very frequently, or a
+new feature writing to KV per-item again instead of as one blob) before
+assuming it's a Cloudflare-side problem — the account-level daily counter
+resets at UTC midnight regardless of what caused it.
 
 ## Long-term signed-in confidence — SOLVED via the mobile app's OAuth client
 
