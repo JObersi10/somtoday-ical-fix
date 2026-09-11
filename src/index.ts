@@ -346,17 +346,27 @@ async function handleCalDavDebug(env: Env): Promise<Response> {
   if (!env.ICLOUD_APPLE_ID || !env.ICLOUD_APP_PASSWORD) {
     return new Response("ICLOUD_APPLE_ID/ICLOUD_APP_PASSWORD not set", { status: 400 });
   }
-  try {
-    const target = await discoverReminderList(
-      env.STATE, env.ICLOUD_APPLE_ID, env.ICLOUD_APP_PASSWORD, env.REMINDERS_LIST_NAME || "Homework"
-    );
-    return new Response(JSON.stringify({ ok: true, target }, null, 2), { headers: { "Content-Type": "application/json" } });
-  } catch (err) {
-    return new Response(
-      JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }, null, 2),
-      { headers: { "Content-Type": "application/json" }, status: 500 }
-    );
-  }
+  const auth = "Basic " + btoa(`${env.ICLOUD_APPLE_ID}:${env.ICLOUD_APP_PASSWORD}`);
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<A:propfind xmlns:A="DAV:">
+<A:prop><A:current-user-principal/></A:prop>
+</A:propfind>`;
+  const bytes = new TextEncoder().encode(xml);
+  const res = await fetch("https://caldav.icloud.com/", {
+    method: "PROPFIND",
+    headers: {
+      Authorization: auth,
+      Depth: "0",
+      "Content-Type": "application/xml; charset=utf-8",
+      "Content-Length": String(bytes.byteLength),
+    },
+    body: bytes,
+  });
+  const text = await res.text();
+  return new Response(
+    JSON.stringify({ status: res.status, httpVersion: res.headers.get("via") ? "via:" + res.headers.get("via") : null, cfRay: res.headers.get("cf-ray"), headers: Object.fromEntries(res.headers), body: text }, null, 2),
+    { headers: { "Content-Type": "application/json" } }
+  );
 }
 
 export default {
