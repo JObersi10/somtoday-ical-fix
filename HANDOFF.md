@@ -1,11 +1,13 @@
 # Handoff — somtoday-fix
 
-Status as of 2026-09-11: **WORKING END TO END, INCLUDING REMINDERS.**
-`/calendar.ics` (65 real lessons), `/homework.ics` (23 real homework items),
-push notifications for cancellations + sync failures, and a real CalDAV sync
-of homework into iCloud Reminders are all live and deployed. Auth now uses
-the mobile app's OAuth client (60-day refresh token, see below) instead of
-the web client's 8-hour one, which was the actual root cause of "keeps
+Status as of 2026-09-11: **Calendar, homework feed, and push notifications
+confirmed working. CalDAV → Reminders sync is implemented and deployed but
+NOT yet confirmed writing real reminders — see "Still unverified" below
+before assuming it's done.** `/calendar.ics` (65 real lessons), `/homework.ics`
+(23 real homework items), and push notifications for cancellations + sync
+failures are all live, deployed, and verified. Auth now uses the mobile
+app's OAuth client (60-day refresh token, see below) instead of the web
+client's 8-hour one, which was the actual root cause of "keeps
 logging me out."
 
 ## What this is
@@ -27,7 +29,7 @@ cancellation data at all. It produces:
   warm, refreshes the Somtoday token, pushes cancellation/failure
   notifications, and writes real Reminders items via CalDAV.
 
-## Homework in Reminders: solved via real CalDAV (Option B)
+## Homework in Reminders: real CalDAV (Option B) — implemented, not yet confirmed working (see "Still unverified" below)
 
 iOS/macOS's generic "Subscribed Calendar" feature only ever imports `VEVENT`
 into Calendar.app — it does not import `VTODO` into Reminders.app at all.
@@ -266,14 +268,34 @@ reverted from that to match their real-world need.
   in practice — worth checking back once a real cancellation happens during
   the school term. (The ntfy push for it is now wired up too — unverified in
   practice for the same reason.)
-- The CalDAV → Reminders sync (`syncHomeworkToReminders`) has not yet been
-  observed running against a real cron tick — secrets were set 2026-09-11
-  and it will run automatically on the next scheduled invocation, but hasn't
-  been confirmed to have actually created reminders in the "Homework" list
-  yet. Check Reminders.app after the next cron tick; if nothing shows up,
-  check the ntfy topic for a "Reminders homework sync is failing" push
-  first, and the KV `caldav_collection:homework` key second (absence means
-  discovery never completed, e.g. wrong list name or app-specific password).
+- **The CalDAV → Reminders sync is NOT confirmed working yet — read this
+  before assuming it's done.** First attempt (2026-09-11) hit a real bug:
+  two dashboard-only Variables (`ICLOUD_APPLE_ID`, `REMINDERS_LIST_NAME`)
+  were wiped by the very next git-triggered deploy (the exact gotcha
+  documented above under `wrangler.toml`) — fixed by moving them into
+  `wrangler.toml [vars]`. After that fix, `discoverReminderList()`'s first
+  PROPFIND consistently got a bare `400` from `caldav.icloud.com` when
+  called through the Worker, while an *identical* request via curl (from
+  outside Cloudflare) succeeded every time. Diagnosed as Cloudflare Workers'
+  `fetch()` sending a plain string body as `Transfer-Encoding: chunked`
+  (no `Content-Length`) by default, which iCloud's CalDAV server appears to
+  reject for PROPFIND/PUT — fixed in `src/caldav.ts` by encoding bodies as a
+  `Uint8Array` with an explicit `Content-Length` header (commit `5ab007a`).
+  **This fix got exactly one clean confirmed success** (a direct 207
+  Multi-Status from a debug endpoint) before further rapid-fire testing
+  started getting silent timeouts instead of clean responses — likely
+  iCloud rate-limiting/throttling the account or Cloudflare's egress IP
+  after many CalDAV requests in a few minutes (same category of mistake as
+  the Somtoday OAuth-replay incident earlier in this project: don't hammer
+  a live third-party auth/sync endpoint with rapid manual retries). Testing
+  was stopped deliberately rather than risk it further. **Next step for a
+  future session**: wait at least 15-30 minutes since the last CalDAV
+  request (let any rate-limit cool down), then check Reminders.app's
+  "Homework" list directly, or hit `/sync-now` once (not repeatedly) and
+  read the `reminders` field. If it still fails, check the KV
+  `caldav_collection:homework` key (absence means discovery never
+  completed) and the raw error message — do not add a debug endpoint and
+  loop-test again; test at most once, wait, then decide.
 
 ## Reference: real captured data this was built against
 
