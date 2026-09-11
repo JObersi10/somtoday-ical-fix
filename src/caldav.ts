@@ -73,9 +73,9 @@ export async function discoverReminderList(
   const principalXml = await propfind(
     `${CALDAV_BASE}/`, appleId, appPassword, "0",
     `<?xml version="1.0" encoding="utf-8"?>
-     <A:propfind xmlns:A="DAV:">
-       <A:prop><A:current-user-principal/></A:prop>
-     </A:propfind>`
+<A:propfind xmlns:A="DAV:">
+<A:prop><A:current-user-principal/></A:prop>
+</A:propfind>`
   );
   const principalHref = extractOne(principalXml, "href");
   if (!principalHref) throw new Error("CalDAV: could not discover current-user-principal");
@@ -84,9 +84,9 @@ export async function discoverReminderList(
   const homeXml = await propfind(
     `${CALDAV_BASE}${principalHref}`, appleId, appPassword, "0",
     `<?xml version="1.0" encoding="utf-8"?>
-     <A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-       <A:prop><C:calendar-home-set/></A:prop>
-     </A:propfind>`
+<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<A:prop><C:calendar-home-set/></A:prop>
+</A:propfind>`
   );
   const homeHref = extractOne(homeXml, "href");
   if (!homeHref) throw new Error("CalDAV: could not discover calendar-home-set");
@@ -96,12 +96,12 @@ export async function discoverReminderList(
   const listXml = await propfind(
     `${CALDAV_BASE}${homeHref}`, appleId, appPassword, "1",
     `<?xml version="1.0" encoding="utf-8"?>
-     <A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-       <A:prop>
-         <A:displayname/>
-         <C:supported-calendar-component-set/>
-       </A:prop>
-     </A:propfind>`
+<A:propfind xmlns:A="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<A:prop>
+<A:displayname/>
+<C:supported-calendar-component-set/>
+</A:prop>
+</A:propfind>`
   );
 
   let match: string | null = null;
