@@ -1,12 +1,12 @@
 # Handoff — somtoday-fix
 
-Status as of 2026-09-09: **WORKING END TO END.** Both `/calendar.ics` and
-`/homework.ics` confirmed returning real data (65 lesson events, real
-homework items with subjects/descriptions) against the live deployed Worker.
-The debug endpoint and diagnostic logging added during setup have been
-removed. Everything below is historical context for how it got here and
-what's still unverified in real-world use (cancellation detection
-specifically — hasn't hit a real cancelled lesson yet).
+Status as of 2026-09-11: **WORKING END TO END, INCLUDING REMINDERS.**
+`/calendar.ics` (65 real lessons), `/homework.ics` (23 real homework items),
+push notifications for cancellations + sync failures, and a real CalDAV sync
+of homework into iCloud Reminders are all live and deployed. Auth now uses
+the mobile app's OAuth client (60-day refresh token, see below) instead of
+the web client's 8-hour one, which was the actual root cause of "keeps
+logging me out."
 
 ## What this is
 
@@ -21,69 +21,92 @@ cancellation data at all. It produces:
 - `/calendar.ics` — lesson schedule, timezone-corrected to America/Curacao
   (fixed UTC-4), with cancelled lessons flagged `[CANCELLED]`.
 - `/homework.ics` — VTODO feed, one task per homework item, due the day
-  before its linked lesson.
-- `/calendar.ics?debug=1` — temporary diagnostic endpoint (see "Cleanup" below).
+  before its linked lesson. (Apple's generic calendar-subscription mechanism
+  won't surface these in Reminders.app — see below for the real fix.)
+- A `scheduled()` cron (every 30 min) that keeps the calendar/homework data
+  warm, refreshes the Somtoday token, pushes cancellation/failure
+  notifications, and writes real Reminders items via CalDAV.
 
-## Current status (updated after user testing)
+## Homework in Reminders: solved via real CalDAV (Option B)
 
-`/calendar.ics` is confirmed correctly deployed and subscribed on the user's
-device, showing the right times. `/homework.ics` is confirmed returning
-correct data server-side, but the user could not get it to appear in the
-**Reminders** app after subscribing via iOS Settings → Calendar → Accounts →
-Add Subscribed Calendar.
+iOS/macOS's generic "Subscribed Calendar" feature only ever imports `VEVENT`
+into Calendar.app — it does not import `VTODO` into Reminders.app at all.
+Confirmed empirically (user subscribed correctly, Calendar accepted it, but
+nothing appeared in Reminders). Three options were considered (A: fake it as
+VEVENT calendar blocks, B: real CalDAV write, C: user-built Shortcut) — **B
+was chosen and implemented**: `src/caldav.ts` is a minimal from-scratch
+CalDAV client (Workers has no XML DOM parser, so PROPFIND multistatus
+responses are picked apart with regex — brittle in general, consistent
+enough for iCloud specifically) that:
 
-### Root cause: this is an Apple platform limitation, not a bug here
+1. Discovers the user's actual iCloud Reminders list matching
+   `REMINDERS_LIST_NAME` (default `"Homework"`) via PROPFIND against
+   `caldav.icloud.com` — the list must already exist (created once by hand
+   in Reminders.app); the Worker deliberately never creates lists itself.
+2. PUTs a real `VTODO` per homework item, keyed by a stable UID
+   (`<uniqueIdentifier>-somtoday-fix-hw.ics`), with `If-None-Match: *` so it
+   only ever *creates*, never overwrites — checking an item off in
+   Reminders.app sticks, a later cron tick won't resurrect it.
 
-iOS/macOS's generic "Subscribed Calendar" feature (`webcal://`/`https://`
-`.ics` URL subscription) only imports `VEVENT` components into Calendar.app.
-It does **not** import `VTODO` components into Reminders.app at all — this
-is a longstanding, well-known Apple limitation, not something fixable by
-changing the ICS output. Confirmed empirically: the user subscribed
-correctly, Calendar accepted the subscription, but no VTODOs surfaced in
-Reminders anywhere.
+Auth is an **Apple ID app-specific password** (generated at
+appleid.apple.com → Sign-In and Security → App-Specific Passwords —
+revocable any time, never the real account password), stored as the
+`ICLOUD_APP_PASSWORD` secret alongside `ICLOUD_APPLE_ID` and
+`REMINDERS_LIST_NAME` (all set 2026-09-11). Runs from `scheduled()` only,
+independent of the calendar sync (`ctx.waitUntil` in parallel) — a CalDAV
+failure (e.g. a revoked app-specific password) can't block the calendar from
+updating, and vice versa.
 
-### Options presented to the user (awaiting their choice)
+## Push notifications (ntfy.sh)
 
-**A. Convert `/homework.ics` from VTODO to VEVENT.** Reuses the exact
-mechanism already proven working for `/calendar.ics`. Shows up reliably as
-calendar entries on the right day. Loses "checkable task" semantics — it's
-just a calendar block, not a completable reminder.
+`src/notify.ts` posts to `https://ntfy.sh/<NTFY_TOPIC>` — a free,
+account-less pub/sub push service. Set `NTFY_TOPIC` to a private-ish random
+string (currently `somtoday-jaden-4d9ea36b`, in `wrangler.toml [vars]`), then
+install the ntfy app and subscribe to that same topic to receive pushes on
+your phone. No API key on either side. Two things trigger a push:
 
-**B. Real CalDAV write into the user's actual iCloud Reminders**, using an
-Apple ID app-specific password (generated at appleid.apple.com, revocable,
-never the real account password) stored as a Cloudflare secret. The Worker
-would do CalDAV discovery (PROPFIND against `caldav.icloud.com`) then PUT
-real VTODO items into a genuine iCloud list. Native, checkable, syncs
-everywhere, real notifications. Significantly more code (CalDAV client from
-scratch) and involves a real (if scoped/revocable) credential.
+1. **Cancellations** — both the in-place `isUitgevallen` flag (deduped via a
+   `notified:<uid>` KV key so it only fires once even though the flag stays
+   true on every subsequent fetch) and the snapshot-diff "vanished from the
+   schedule" path (naturally one-shot, see `snapshot.ts`).
+2. **Sync failures** — `reportSyncOutcome()` in `src/index.ts` tracks a
+   consecutive-failure streak per sync type (`cal` for the calendar,
+   `reminders` for CalDAV) in KV, and only pages you after
+   `FAIL_ALERT_THRESHOLD` (2) consecutive failures — avoids noise from a
+   single transient blip — then sends one "recovered" push once it's working
+   again. The two trackers are independent (a Reminders outage won't mask a
+   calendar outage or vice versa).
 
-**C. An Apple Shortcut the user builds/runs on-device.** Expose a plain
-`/homework.json` endpoint (not built yet); user builds a Shortcut (Get
-Contents of URL → parse JSON → loop → "Add New Reminder") and sets it as a
-daily Personal Automation. Zero credentials touch the Worker — Shortcuts
-already has on-device Reminders access. Needs the user to build/import the
-Shortcut once and handle de-duplication logic (so it doesn't re-add the same
-homework every run) themselves in Shortcuts.
+## Long-term signed-in confidence — SOLVED via the mobile app's OAuth client
 
-**Recommendation given to the user**: C if they're willing to spend ~10 min
-in Shortcuts (safest, no credentials anywhere); A for zero extra setup right
-now; B only if "real checkable task in Reminders" matters enough to justify
-a CalDAV implementation. **No option has been implemented yet** — waiting
-on the user's pick before writing any of A/B/C's code.
+The web client's `client_id` (`somtoday-leerling-web`) issues refresh tokens
+with an 8-hour lifetime — confirmed by decoding a real refresh_token JWT's
+`iat`/`exp`. That was the actual root cause of "keeps logging me out": no
+client was refreshing inside that 8h window. **Fixed 2026-09-11** by
+capturing a token from the real Somtoday mobile app instead (via Charles
+Proxy with SSL Proxying enabled + the Charles root cert trusted on the
+iPhone — plain Wireshark can't see inside TLS without this). The mobile
+app's `client_id` (`somtoday-leerling-native`, confirmed from the app's own
+bundled JS — it's actually a Capacitor WebView, not truly native) issues
+refresh tokens with a **60-day** lifetime instead. `SOMTODAY_CLIENT_ID` in
+`wrangler.toml [vars]` now selects the native client, and
+`SOMTODAY_REFRESH_TOKEN` holds a token issued to it. Since the cron refreshes
+(and rotates) this token every 30 minutes — vastly more often than the
+60-day window — this should now be a **one-time setup**, not a recurring
+chore, as long as the cron keeps firing. Only failure mode: Cloudflare's cron
+silently stops firing for 60 days straight (would need a fresh capture via
+the same Charles Proxy process if it ever happens — see git history for the
+exact steps, or ask a future session to walk through it again). A
+sync-failure push notification (see above) will surface this immediately
+either way, rather than you discovering it by opening a stale calendar.
 
-## Long-term signed-in confidence
-
-Refresh token: 8h lifetime, rotates every use. Cron trigger fires every 30
-min regardless of user activity (confirmed live in the dashboard: "Runs
-Every 30 minutes" under Trigger Events) — that's ~16 refresh opportunities
-per 8h window, so it should never lapse under normal operation. Only failure
-mode: if Cloudflare's cron silently stops firing (or gets disabled) for
->8h straight, the token goes stale and needs a fresh manual paste again
-(same procedure as before — see "What went wrong" below for the exact
-symptoms to watch for: empty calendar + a 401/"Token revoked" on the
-debug path, though the debug path has since been removed — re-add a
-temporary one if this happens again, following the pattern removed in this
-session's "Cleanup" section).
+**Gotcha to remember**: after rotating `SOMTODAY_REFRESH_TOKEN`, you must
+also delete the `somtoday_tokens` key from the `STATE` KV namespace
+(Cloudflare dashboard → Storage & databases → Workers KV → STATE) — otherwise
+the Worker keeps serving a cached (now-dead) access token instead of ever
+trying the fresh refresh token. This bit us twice across two different token
+rotations in this project; always check this first if a secret update
+doesn't seem to take effect.
 
 ## IMPORTANT: the timezone logic is NOT a real UTC conversion (read this first)
 
@@ -161,6 +184,10 @@ reverted from that to match their real-world need.
   use, diffing is the PRIMARY cancellation-detection mechanism, not a
   backstop. (This is worth re-verifying once real cancellation data is
   observed — it hasn't been tested against an actual cancelled lesson yet.)
+- **`src/notify.ts`** — thin ntfy.sh push-notification wrapper. Best-effort
+  by design: a failed push must never take down the sync it's reporting on.
+- **`src/caldav.ts`** — minimal CalDAV client for writing real VTODO items
+  into an iCloud Reminders list. See "Homework in Reminders" above.
 - **`wrangler.toml`** — deployment config.
   - **Non-obvious TOML bug already fixed**: `kv_namespaces` MUST appear
     before any `[table]` header (`[vars]`, `[triggers]`). Cloudflare
@@ -237,7 +264,16 @@ reverted from that to match their real-world need.
 - Cancellation detection (`isUitgevallen` + snapshot diff) has never been
   observed against a real cancelled lesson. Logic is sound but unverified
   in practice — worth checking back once a real cancellation happens during
-  the school term.
+  the school term. (The ntfy push for it is now wired up too — unverified in
+  practice for the same reason.)
+- The CalDAV → Reminders sync (`syncHomeworkToReminders`) has not yet been
+  observed running against a real cron tick — secrets were set 2026-09-11
+  and it will run automatically on the next scheduled invocation, but hasn't
+  been confirmed to have actually created reminders in the "Homework" list
+  yet. Check Reminders.app after the next cron tick; if nothing shows up,
+  check the ntfy topic for a "Reminders homework sync is failing" push
+  first, and the KV `caldav_collection:homework` key second (absence means
+  discovery never completed, e.g. wrong list name or app-specific password).
 
 ## Reference: real captured data this was built against
 
