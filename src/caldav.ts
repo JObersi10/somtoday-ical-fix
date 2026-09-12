@@ -58,11 +58,16 @@ async function propfind(
     headers: {
       Authorization: authHeader(appleId, appPassword),
       Depth: depth,
-      "Content-Type": "application/xml; charset=utf-8",
+      "Content-Type": "text/xml; charset=utf-8",
       "Content-Length": String(bytes.byteLength),
       "User-Agent": USER_AGENT,
     },
     body: bytes,
+    // Workers' fetch() negotiates HTTP/2 upstream by default; Apple's CalDAV
+    // stack is suspected of mishandling WebDAV extension methods (PROPFIND)
+    // over HTTP/2. This forces HTTP/1.1 if the runtime honors it; if it
+    // doesn't recognize the option it's silently ignored, so it's a free try.
+    cf: { http_protocol: "http/1.1" },
   });
   if (!res.ok && res.status !== 207) {
     throw new Error(`CalDAV PROPFIND ${url} -> ${res.status}: ${await res.text()}`);
