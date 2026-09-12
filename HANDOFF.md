@@ -2,7 +2,8 @@
 
 Status as of 2026-09-11: **Calendar, homework feed, and push notifications
 confirmed working. CalDAV → Reminders sync is implemented and deployed but
-NOT yet confirmed writing real reminders — see "Still unverified" below
+still fails with a bare 400 on every attempt (Content-Length and User-Agent
+fixes both tried and ruled insufficient) — see "Still unverified" below
 before assuming it's done.** `/calendar.ics` (65 real lessons), `/homework.ics`
 (23 real homework items), and push notifications for cancellations + sync
 failures are all live, deployed, and verified. Auth now uses the mobile
@@ -346,14 +347,34 @@ reverted from that to match their real-world need.
   after many CalDAV requests in a few minutes (same category of mistake as
   the Somtoday OAuth-replay incident earlier in this project: don't hammer
   a live third-party auth/sync endpoint with rapid manual retries). Testing
-  was stopped deliberately rather than risk it further. **Next step for a
-  future session**: wait at least 15-30 minutes since the last CalDAV
-  request (let any rate-limit cool down), then check Reminders.app's
-  "Homework" list directly, or hit `/sync-now` once (not repeatedly) and
-  read the `reminders` field. If it still fails, check the KV
-  `caldav_collection:homework` key (absence means discovery never
-  completed) and the raw error message — do not add a debug endpoint and
-  loop-test again; test at most once, wait, then decide.
+  was stopped deliberately rather than risk it further.
+
+  **Re-tested 2026-09-11 (single clean check, hours later, after the KV
+  outage had fully reset)**: still fails, exact same bare `400` from
+  `discoverReminderList()`'s first PROPFIND — so this is NOT the KV outage
+  or rate-limiting, it's a real standing bug. Ruled out **User-Agent**:
+  hypothesized (and web-search-corroborated) that iCloud's CalDAV edge
+  rejects requests with no `User-Agent` header, since Workers' `fetch()`
+  sends none by default and curl always does. Added a browser-shaped
+  `User-Agent` to every CalDAV request (commit `ad870be`) and re-tested
+  once — **no change, identical bare 400**. So the Content-Length fix is
+  real and necessary but not sufficient, and it isn't a missing-header
+  issue at all.
+
+  **Leading theory not yet tested**: Apple's CalDAV edge may be blocking or
+  rate-limiting requests specifically by **Cloudflare Workers' outbound IP
+  range** (a "datacenter/cloud egress" block), which a residential curl
+  request would never hit — this would explain "identical request, curl
+  works, Worker never does" better than any header difference. Not yet
+  confirmed. **Next step for a future session**: this needs actual
+  evidence, not another guess-and-redeploy cycle — e.g. try the same
+  PROPFIND from a different cloud provider's serverless function to see if
+  it's Cloudflare-specific, or look for Apple documentation/community
+  reports of CalDAV blocking known cloud IP ranges. Do not just add another
+  header and hope; the last two attempts (Content-Length, User-Agent) were
+  each a single plausible guess tested once and ruled in/out cleanly — keep
+  that discipline. Test at most once per hypothesis, wait between attempts,
+  and update this section either way.
 
 ## Reference: real captured data this was built against
 
