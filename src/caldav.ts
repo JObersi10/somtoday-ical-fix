@@ -14,6 +14,12 @@
 
 const CALDAV_BASE = "https://caldav.icloud.com";
 
+// iCloud's CalDAV server (and/or Cloudflare's edge in front of it) appears to
+// reject requests that carry no User-Agent, or an unrecognized one, with a
+// bare 400 — Workers' fetch() sends no User-Agent by default. A generic
+// browser-shaped UA is confirmed to get through where the default doesn't.
+const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+
 function authHeader(appleId: string, appPassword: string): string {
   return "Basic " + btoa(`${appleId}:${appPassword}`);
 }
@@ -54,6 +60,7 @@ async function propfind(
       Depth: depth,
       "Content-Type": "application/xml; charset=utf-8",
       "Content-Length": String(bytes.byteLength),
+      "User-Agent": USER_AGENT,
     },
     body: bytes,
   });
@@ -171,7 +178,10 @@ export async function ensureReminder(
   uid: string, summary: string, description: string | undefined, due: Date
 ): Promise<"created" | "exists"> {
   const url = `${target.collectionUrl}${uid}.ics`;
-  const head = await fetch(url, { method: "HEAD", headers: { Authorization: authHeader(appleId, appPassword) } });
+  const head = await fetch(url, {
+    method: "HEAD",
+    headers: { Authorization: authHeader(appleId, appPassword), "User-Agent": USER_AGENT },
+  });
   if (head.status === 200) return "exists";
 
   const bodyBytes = new TextEncoder().encode(buildVTodoIcs(uid, summary, description, due));
@@ -182,6 +192,7 @@ export async function ensureReminder(
       "Content-Type": "text/calendar; charset=utf-8",
       "Content-Length": String(bodyBytes.byteLength),
       "If-None-Match": "*",
+      "User-Agent": USER_AGENT,
     },
     body: bodyBytes,
   });
