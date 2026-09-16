@@ -31,6 +31,28 @@ function requireAuth(req: Request, env: Env): Response | null {
   return new Response("Unauthorized. Add ?token=YOUR_TOKEN to the URL.", { status: 401 });
 }
 
+function wallClockPartsInZone(d: Date, timeZone: string): { y: number; mo: number; d: number; h: number; mi: number; s: number } {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const p = Object.fromEntries(dtf.formatToParts(d).map((x) => [x.type, x.value]));
+  return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour, mi: +p.minute, s: +p.second };
+}
+
+/** Same "read the clock digits, treat them as Curacao time" fix as
+ * localWallToUtc below, but starting from a real correct UTC instant (from
+ * the public per-student iCal feed, which has genuine DST-aware Europe/
+ * Amsterdam times) instead of Somtoday's raw offset-less API digits. Reads
+ * the Amsterdam wall-clock digits at that instant, then reinterprets those
+ * same digits as America/Curacao civil time. */
+function amsterdamInstantAsCuracaoDigits(d: Date): string {
+  const p = wallClockPartsInZone(d, "Europe/Amsterdam");
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${p.y}-${pad(p.mo)}-${pad(p.d)}T${pad(p.h)}:${pad(p.mi)}:${pad(p.s)}`;
+}
+
 function localWallToUtc(iso: string): Date {
   // Somtoday's beginDatumTijd/eindDatumTijd ("2026-09-07T07:30:00", no
   // offset) is the literal clock number the school schedule uses — e.g.
@@ -69,6 +91,30 @@ function afspraakToVEvent(item: RAfspraakItem, cancelled = false): VEvent {
     status: cancelled ? "CANCELLED" : "CONFIRMED",
     raw: {},
   };
+}
+
+/** Fetch the public, unauthenticated per-student iCalendar stream and adapt
+ * it into the same RAfspraakItem shape the OAuth-based afspraakitems fetch
+ * produces, so it can flow through the exact same diff/cancellation/serialize
+ * pipeline below. No Somtoday login, no token refresh, no revocation risk —
+ * this feed is keyed by GUIDs in the URL itself, not a session. Trade-off:
+ * no `isUitgevallen` flag and no homework in this feed (see README/HANDOFF),
+ * so cancellation detection here relies entirely on the snapshot-diff
+ * backstop (a UID vanishing from the feed) rather than an explicit flag —
+ * which is exactly what the diff logic was already built for. */
+async function fetchIcalAsAfspraken(feedUrl: string): Promise<RAfspraakItem[]> {
+  const upstream = await fetch(feedUrl);
+  if (!upstream.ok) throw new Error(`Failed to fetch upstream iCal: ${upstream.status}`);
+  const text = await upstream.text();
+  const { events } = parseIcs(text);
+  return events.map((ev): RAfspraakItem => ({
+    uniqueIdentifier: ev.uid,
+    afspraakItemType: "ROOSTER",
+    titel: ev.summary,
+    locatie: ev.location,
+    beginDatumTijd: amsterdamInstantAsCuracaoDigits(ev.start),
+    eindDatumTijd: amsterdamInstantAsCuracaoDigits(ev.end),
+  }));
 }
 
 async function resolveAccessToken(env: Env): Promise<string> {
@@ -156,10 +202,11 @@ async function reportSyncOutcome(env: Env, keyPrefix: string, label: string, ok:
   }
 }
 
-async function syncAndCache(env: Env): Promise<string> {
+async function syncAndCache(env: Env, feedUrl?: string): Promise<string> {
   try {
-    const token = await resolveAccessToken(env);
-    const items = await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, token, new Date());
+    const items = feedUrl
+      ? await fetchIcalAsAfspraken(feedUrl)
+      : await fetchAfspraken(env.SOMTODAY_LEERLING_ID!, await resolveAccessToken(env), new Date());
     const { current, cancelled } = await diffAndUpdateSnapshot(env.STATE, items);
 
     const events: VEvent[] = [
@@ -237,73 +284,65 @@ const CALENDAR_COOLDOWN_MS = 15 * 60 * 1000;
 
 async function handleCalendar(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
-
-  // Mode A: authenticated Somtoday API — real cancellations + homework.
-  if (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) {
-    // Every hit to this endpoint (e.g. Calendar.app opening/refreshing) used
-    // to trigger a full live Somtoday fetch + KV write with zero throttling —
-    // fine occasionally, wasteful if the app polls repeatedly in a short
-    // window (and a real contributor to the KV daily-write-limit incident,
-    // see HANDOFF.md). A 15-minute cooldown: serve the cached result
-    // instantly within the window, do a real fresh sync once it's passed.
-    // The cron's hourly tick is unaffected — this only gates the on-demand
-    // HTTP path, and /sync-now always forces a real sync regardless.
-    const lastSyncAt = Number(await env.STATE.get("last_full_sync_at")) || 0;
-    const cachedFresh = await env.STATE.get("last_good_ics");
-    if (cachedFresh && Date.now() - lastSyncAt < CALENDAR_COOLDOWN_MS) {
-      return new Response(cachedFresh, {
-        headers: { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "no-cache" },
-      });
-    }
-
-    try {
-      const body = await syncAndCache(env);
-      return new Response(body, {
-        headers: { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "no-cache" },
-      });
-    } catch (err) {
-      // Degrade gracefully: serve the last known-good calendar (if any) with
-      // a warning event, instead of a hard failure — token refresh issues
-      // shouldn't nuke your whole calendar mid-week. Guard env.STATE itself
-      // being missing (e.g. a misconfigured binding) so this fallback path
-      // can never itself throw an uncaught exception.
-      const cached = env.STATE ? await env.STATE.get("last_good_ics") : null;
-      if (cached) {
-        const warning = serializeIcs(
-          [{
-            uid: `warning-${Date.now()}@somtoday-fix`,
-            summary: "[Somtoday-fix] Sync failing — showing cached schedule",
-            description: String(err instanceof Error ? err.message : err),
-            start: new Date(),
-            end: new Date(Date.now() + 15 * 60 * 1000),
-            status: "CONFIRMED",
-            raw: {},
-          }],
-          { calname: "warning" }
-        );
-        const merged = cached.replace("END:VCALENDAR", "") +
-          warning.split("BEGIN:VEVENT")[1].replace("END:VCALENDAR", "") + "END:VCALENDAR\r\n";
-        return new Response(merged, { headers: { "Content-Type": "text/calendar; charset=utf-8" } });
-      }
-      return new Response(`Somtoday sync error: ${err instanceof Error ? err.message : err}`, { status: 502 });
-    }
-  }
-
-  // Mode B: plain iCal passthrough with timezone correction only (no
-  // cancellation/homework data available in this feed — see README).
+  // Preferred: the public per-student iCal stream (no login, no token to
+  // expire or get revoked — keyed by GUIDs in the URL itself). Falls back to
+  // the authenticated Somtoday API only if no feed URL is configured.
   const feedUrl = url.searchParams.get("url") || env.SOMTODAY_ICAL_URL;
-  if (!feedUrl) {
+  const hasAuthedApi = env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME);
+
+  if (!feedUrl && !hasAuthedApi) {
     return new Response(
-      "Missing ?url=<somtoday ical feed> and no SOMTODAY_LEERLING_ID configured for API mode.",
+      "Missing ?url=<somtoday ical feed>, no SOMTODAY_ICAL_URL configured, and no SOMTODAY_LEERLING_ID for API mode.",
       { status: 400 }
     );
   }
-  const upstream = await fetch(feedUrl);
-  if (!upstream.ok) return new Response("Failed to fetch upstream iCal", { status: 502 });
-  const text = await upstream.text();
-  const { events } = parseIcs(text);
-  const body = serializeIcs(events, { calname: "Somtoday (AST, no cancellations)" });
-  return new Response(body, { headers: { "Content-Type": "text/calendar; charset=utf-8" } });
+
+  // Every hit to this endpoint (e.g. Calendar.app opening/refreshing) used
+  // to trigger a full live fetch + KV write with zero throttling — fine
+  // occasionally, wasteful if the app polls repeatedly in a short window
+  // (and a real contributor to the KV daily-write-limit incident, see
+  // HANDOFF.md). A 15-minute cooldown: serve the cached result instantly
+  // within the window, do a real fresh sync once it's passed. The cron's
+  // hourly tick is unaffected — this only gates the on-demand HTTP path,
+  // and /sync-now always forces a real sync regardless.
+  const lastSyncAt = Number(await env.STATE.get("last_full_sync_at")) || 0;
+  const cachedFresh = await env.STATE.get("last_good_ics");
+  if (cachedFresh && Date.now() - lastSyncAt < CALENDAR_COOLDOWN_MS) {
+    return new Response(cachedFresh, {
+      headers: { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "no-cache" },
+    });
+  }
+
+  try {
+    const body = await syncAndCache(env, feedUrl || undefined);
+    return new Response(body, {
+      headers: { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "no-cache" },
+    });
+  } catch (err) {
+    // Degrade gracefully: serve the last known-good calendar (if any) with a
+    // warning event, instead of a hard failure. Guard env.STATE itself being
+    // missing (e.g. a misconfigured binding) so this fallback path can never
+    // itself throw an uncaught exception.
+    const cached = env.STATE ? await env.STATE.get("last_good_ics") : null;
+    if (cached) {
+      const warning = serializeIcs(
+        [{
+          uid: `warning-${Date.now()}@somtoday-fix`,
+          summary: "[Somtoday-fix] Sync failing — showing cached schedule",
+          description: String(err instanceof Error ? err.message : err),
+          start: new Date(),
+          end: new Date(Date.now() + 15 * 60 * 1000),
+          status: "CONFIRMED",
+          raw: {},
+        }],
+        { calname: "warning" }
+      );
+      const merged = cached.replace("END:VCALENDAR", "") +
+        warning.split("BEGIN:VEVENT")[1].replace("END:VCALENDAR", "") + "END:VCALENDAR\r\n";
+      return new Response(merged, { headers: { "Content-Type": "text/calendar; charset=utf-8" } });
+    }
+    return new Response(`Somtoday sync error: ${err instanceof Error ? err.message : err}`, { status: 502 });
+  }
 }
 
 async function handleHomework(req: Request, env: Env): Promise<Response> {
@@ -339,7 +378,7 @@ async function handleSyncNow(env: Env): Promise<Response> {
   const result: Record<string, { ok: boolean; error?: string }> = {};
 
   try {
-    await syncAndCache(env);
+    await syncAndCache(env, env.SOMTODAY_ICAL_URL);
     result.calendar = { ok: true };
   } catch (err) {
     result.calendar = { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -381,19 +420,25 @@ export default {
    * polling right now — this is what makes cancellation detection reliable
    * and keeps the Somtoday login refreshed automatically 24/7. */
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (!env.SOMTODAY_LEERLING_ID || !(env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) return;
-    ctx.waitUntil(
-      syncAndCache(env).catch((err) => {
-        console.error("scheduled sync failed:", err instanceof Error ? err.message : err);
-      })
-    );
+    const hasCalMode = env.SOMTODAY_ICAL_URL || (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME));
+    if (hasCalMode) {
+      ctx.waitUntil(
+        syncAndCache(env, env.SOMTODAY_ICAL_URL).catch((err) => {
+          console.error("scheduled sync failed:", err instanceof Error ? err.message : err);
+        })
+      );
+    }
     // Independent of the calendar sync above — a Reminders/CalDAV failure
     // (e.g. a revoked app-specific password) must never block the calendar
-    // from updating, and vice versa.
-    ctx.waitUntil(
-      syncHomeworkToReminders(env).catch((err) => {
-        console.error("scheduled reminders sync failed:", err instanceof Error ? err.message : err);
-      })
-    );
+    // from updating, and vice versa. Homework still needs the authenticated
+    // API (the public iCal feed has no homework data), so this only does
+    // anything useful while SOMTODAY_REFRESH_TOKEN is a live token.
+    if (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) {
+      ctx.waitUntil(
+        syncHomeworkToReminders(env).catch((err) => {
+          console.error("scheduled reminders sync failed:", err instanceof Error ? err.message : err);
+        })
+      );
+    }
   },
 };
