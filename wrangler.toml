@@ -44,6 +44,15 @@ NTFY_TOPIC = "somtoday-jaden-4d9ea36b"
 # The actual credential (ICLOUD_APP_PASSWORD) stays a dashboard Secret.
 ICLOUD_APPLE_ID = "obersi@gmail.com"
 REMINDERS_LIST_NAME = "Homework"
+# The public, unauthenticated per-student iCal stream (calendar.somtoday.nl
+# equivalent) — see HANDOFF.md "2026-09-16: dropped OAuth for calendar sync".
+# This is the primary calendar data source now; no login/token involved.
+# It's a capability URL (whoever has it can read the schedule), so it's
+# moderate-sensitivity, but not a real account credential — same tier as
+# NTFY_TOPIC above, not a Secret. Was briefly added as a dashboard-only
+# Variable, which would've gotten wiped by the next deploy (the same
+# recurring gotcha) — moved here to actually stick.
+SOMTODAY_ICAL_URL = "https://api.somtoday.nl/rest/v1/icalendar/stream/aa420f78-82d8-4a2a-bbfe-d7144194fc5c/d080bcc8-3657-4037-a264-1c0f5794ba5e"
 
 # Runs the sync automatically once an hour, independent of whether your
 # calendar app happens to be polling — this is what "runs automatically"
@@ -62,7 +71,6 @@ crons = ["0 * * * *"]
 # All secrets below are set with:  wrangler secret put NAME
 # (or pasted into Settings -> Variables and Secrets in the dashboard)
 #
-#   SOMTODAY_REFRESH_TOKEN captured refresh_token (recommended auth mode)
-#   SOMTODAY_ICAL_URL      fallback public iCal feed URL (used only if no API creds set)
+#   SOMTODAY_REFRESH_TOKEN captured refresh_token (homework/Reminders only now — see below)
 #   HOMEWORK_HOUR          local AST hour (0-23) for homework reminders, default 16
 #   CAL_TOKEN              optional shared secret; if set, callers must add ?token=...
