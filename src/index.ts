@@ -384,12 +384,11 @@ async function handleSyncNow(env: Env): Promise<Response> {
     result.calendar = { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 
-  try {
-    await syncHomeworkToReminders(env);
-    result.reminders = { ok: true };
-  } catch (err) {
-    result.reminders = { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+  // Disabled 2026-09-16 to save Cloudflare KV/bandwidth: this still depended
+  // on the dead OAuth path, so every run was a wasted failing API call plus
+  // KV writes for the fail-streak tracker. Re-enable by uncommenting once
+  // the Somtoday auth story is worth revisiting — see HANDOFF.md.
+  result.reminders = { ok: true, error: "disabled — calendar-only mode" } as { ok: boolean; error?: string };
 
   return new Response(JSON.stringify(result, null, 2), {
     headers: { "Content-Type": "application/json" },
@@ -428,17 +427,11 @@ export default {
         })
       );
     }
-    // Independent of the calendar sync above — a Reminders/CalDAV failure
-    // (e.g. a revoked app-specific password) must never block the calendar
-    // from updating, and vice versa. Homework still needs the authenticated
-    // API (the public iCal feed has no homework data), so this only does
-    // anything useful while SOMTODAY_REFRESH_TOKEN is a live token.
-    if (env.SOMTODAY_LEERLING_ID && (env.SOMTODAY_REFRESH_TOKEN || env.SOMTODAY_USERNAME)) {
-      ctx.waitUntil(
-        syncHomeworkToReminders(env).catch((err) => {
-          console.error("scheduled reminders sync failed:", err instanceof Error ? err.message : err);
-        })
-      );
-    }
+    // Homework/Reminders sync disabled 2026-09-16 to save Cloudflare
+    // KV/bandwidth: it still depended on the dead OAuth path (the public
+    // iCal feed used above has no homework data), so every hourly tick was
+    // a guaranteed-failing API call plus KV writes for the fail-streak
+    // tracker. Re-enable once the Somtoday auth story is worth revisiting —
+    // see HANDOFF.md "Long-term signed-in confidence".
   },
 };
